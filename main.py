@@ -848,14 +848,24 @@ class ChaosRNGController:
                 elif cmd == 'PING':
                     writer.write(b'PONG\n')
                     await writer.drain()
-                elif cmd == 'STATUS':
-                    writer.write((json.dumps(self._get_status(), ensure_ascii=False) + '\n').encode())
-                    await writer.drain()
+                elif cmd.startswith('STATUS'):
+                    # STATUS 命令需要验证密钥
+                    # 优先使用 OneBot access_token，未配置则使用默认 114514
+                    ob_token = self.config.get("onebot", {}).get("access_token", "")
+                    expected_key = ob_token if ob_token else "114514"
+                    parts = cmd.split(maxsplit=1)
+                    key = parts[1].strip() if len(parts) > 1 else ''
+                    if key == expected_key:
+                        writer.write((json.dumps(self._get_status(), ensure_ascii=False) + '\n').encode())
+                        await writer.drain()
+                    else:
+                        writer.write(b'FORBIDDEN: STATUS requires key\n')
+                        await writer.drain()
                 elif cmd == 'CAPS':
                     writer.write((json.dumps(self.capabilities, ensure_ascii=False) + '\n').encode())
                     await writer.drain()
                 else:
-                    writer.write(b'ERROR: GET_SEED GET_HEX PING STATUS CAPS\n')
+                    writer.write(b'ERROR: GET_SEED GET_HEX PING STATUS <key> CAPS\n')
                     await writer.drain()
         except:
             pass

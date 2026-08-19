@@ -115,7 +115,7 @@ entropy_processing:
 # === TCP 种子服务 ===
 tcp_server:
   enabled: true
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 18888
 
 # === 调度配置 ===
