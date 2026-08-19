@@ -167,8 +167,37 @@ class SystemEntropyCollector:
 
     # ---------- 2. 会话数据 ----------
     async def _collect_session(self) -> int:
-        """采集会话和环境数据"""
+        """
+        采集会话和环境数据。
+        安全策略：
+        - 不存储环境变量原文
+        - 每个值独立哈希（完整64字符 + 32字节随机盐）
+        - 使用 bytearray 作为中间缓冲区，处理后立即清零
+        - 最小化敏感值在显式变量中的生命周期
+        """
         try:
+            # 生成随机盐值，防止已知明文攻击
+            salt = os.urandom(32)
+
+            # 环境变量处理：只存键名，值做独立完整哈希（不截断）
+            env_hashes = {}
+            for key in sorted(os.environ.keys()):
+                # 读取值后立即转 bytearray，哈希后清零
+                value = os.environ[key]
+                value_buf = bytearray(value, 'utf-8')
+                try:
+                    env_hashes[key] = hashlib.sha256(salt + value_buf).hexdigest()
+                finally:
+                    for i in range(len(value_buf)):
+                        value_buf[i] = 0
+                # 显式删除引用
+                value = ""
+
+            # 盐值也清零（只保留前缀用于验证）
+            salt_prefix = salt.hex()[:16]
+            for i in range(len(salt)):
+                salt[i] = 0
+
             data = {
                 "time_ns": time.perf_counter_ns(),
                 "time_wall": time.time_ns(),
@@ -178,7 +207,8 @@ class SystemEntropyCollector:
                 "gid": os.getgid() if hasattr(os, "getgid") else 0,
                 "cwd": os.getcwd(),
                 "env_keys": sorted(os.environ.keys()),
-                "env_hash": hashlib.sha256(str(sorted(os.environ.items())).encode()).hexdigest()[:16],
+                "env_hashes": env_hashes,  # 完整64字符哈希，加盐
+                "salt_prefix": salt_prefix,  # 只记录盐值前缀
                 "python_version": sys.version,
                 "platform": platform.platform(),
                 "processor": platform.processor(),

@@ -15,6 +15,37 @@ import asyncio
 import logging
 from typing import Optional, Dict, Any
 
+
+def _secure_hash(data: str) -> str:
+    """
+    计算字符串的 SHA-256 哈希，使用 bytearray 作为中间缓冲区以便清零。
+    注意：Python str 不可变，原始字符串仍可能残留于内存直到 GC，
+    但此函数最小化了敏感数据的显式引用生命周期。
+    """
+    buf = bytearray(data, 'utf-8')
+    try:
+        return hashlib.sha256(buf).hexdigest()
+    finally:
+        # 清零中间缓冲区
+        for i in range(len(buf)):
+            buf[i] = 0
+
+
+def _secure_mix(pool, prefix: str, sensitive: str, suffix: str) -> None:
+    """
+    将 prefix + sensitive + suffix 哈希后混入熵池，然后清零 sensitive 部分。
+    """
+    prefix_b = bytearray(prefix, 'utf-8')
+    sensitive_b = bytearray(sensitive, 'utf-8')
+    suffix_b = bytearray(suffix, 'utf-8')
+    try:
+        combined = prefix_b + sensitive_b + suffix_b
+        pool.mix_bytes(hashlib.sha256(combined).digest())
+    finally:
+        for b in (sensitive_b, combined):
+            for i in range(len(b)):
+                b[i] = 0
+
 logger = logging.getLogger("chaos_rng.onebot")
 
 # 尝试导入 websockets
@@ -174,10 +205,16 @@ class OneBotV11Client:
             self._mix_event_data(data, "request")
 
     async def _handle_message_event(self, data: Dict[str, Any]):
-        """处理消息事件，提取内容混入熵池"""
+        """
+        处理消息事件，提取内容混入熵池。
+        安全策略：
+        - 缓冲区只存 msg_hash，不存 raw_msg
+        - 使用 bytearray 处理敏感数据，处理后立即清零
+        - 尽量缩短 raw_msg 在显式变量中的生命周期
+        """
         message_type = data.get("message_type", "unknown")
-        user_id = data.get("user_id", "unknown")
-        group_id = data.get("group_id", "private")
+        user_id = str(data.get("user_id", "unknown"))
+        group_id = str(data.get("group_id", "private"))
         raw_msg = data.get("raw_message", "")
         message_id = data.get("message_id", 0)
 
@@ -188,24 +225,34 @@ class OneBotV11Client:
         if self.self_id and str(data.get("self_id")) == str(self.self_id):
             return
 
-        # 将消息加入缓冲区
+        # 计算消息哈希（使用安全函数，中间缓冲区可清零）
+        msg_hash = _secure_hash(raw_msg)
+
+        # 将哈希加入缓冲区（绝不存原文）
         async with self._buffer_lock:
             self._message_buffer.append({
-                "msg": raw_msg,
-                "group": str(group_id),
-                "user": str(user_id),
+                "msg_hash": msg_hash,
+                "group": group_id,
+                "user": user_id,
                 "time": time.time()
             })
             if len(self._message_buffer) > self._buffer_maxlen:
                 self._message_buffer.pop(0)
 
-        # 直接混入熵池
-        combined = f"{user_id}:{group_id}:{raw_msg}:{message_id}:{time.time()}"
-        hash_bytes = hashlib.sha256(combined.encode('utf-8')).digest()
-        self.pool.mix_bytes(hash_bytes)
+        # 混入熵池（敏感部分使用 bytearray，处理后清零）
+        _secure_mix(
+            self.pool,
+            prefix=f"{user_id}:{group_id}:",
+            sensitive=raw_msg,
+            suffix=f":{message_id}:{time.time()}"
+        )
+
+        # 显式删除引用，缩短生命周期
+        raw_msg = ""
+        data["raw_message"] = ""
 
         self._message_count += 1
-        logger.debug(f"收到消息 [{message_type}] 来自 {user_id}: {raw_msg[:30]}...")
+        logger.debug(f"收到消息 [{message_type}] 来自 {user_id}")
 
     def _mix_event_data(self, data: Dict[str, Any], event_type: str):
         """将事件数据混入熵池"""
@@ -250,7 +297,7 @@ class OneBotV11Client:
             return None
 
     async def sample_messages(self, n: int = 10) -> list:
-        """从缓冲区随机采样 n 条消息"""
+        """从缓冲区随机采样 n 条消息哈希"""
         async with self._buffer_lock:
             if not self._message_buffer:
                 return []
@@ -258,10 +305,10 @@ class OneBotV11Client:
             seen = set()
             unique = []
             for item in self._message_buffer:
-                key = (item["group"], item["msg"])
+                key = (item["group"], item["msg_hash"])
                 if key not in seen:
                     seen.add(key)
-                    unique.append(item["msg"])
+                    unique.append(item["msg_hash"])
 
             if len(unique) <= n:
                 return unique
