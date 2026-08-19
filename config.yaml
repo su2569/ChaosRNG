@@ -1,0 +1,127 @@
+# Chaos RNG 独立程序配置文件
+
+# === 权限与提权 ===
+permissions:
+  auto_elevate: true
+  keep_original: false
+
+# === OneBot V11 客户端 ===
+onebot:
+  enabled: true
+  ws_url: "ws://127.0.0.1:3001/"
+  access_token: ""
+  reconnect_interval: 5
+  heartbeat_interval: 30
+  self_id: null
+  auto_collect: true
+  auto_collect_interval: 60
+
+# === 网络抓包 ===
+packet_capture:
+  enabled: true
+  interface: null
+  filter: "tcp or udp"
+  duration: 15
+  max_payload: 256
+  prefer_scapy: true
+
+# === 扩展熵源采集 ===
+entropy_sources:
+  process:
+    enabled: true
+    interval: 2
+
+  weather:
+    enabled: true
+    interval: 600
+    sample_count: 5
+
+  audio:
+    enabled: true
+    sample_rate: 44100
+    chunk_size: 1024
+    channels: 1
+    collection_interval: 5
+    use_von_neumann: true
+
+  camera:
+    enabled: true
+    device_id: 0
+    collection_interval: 10
+    use_von_neumann: true
+
+  input:
+    enabled: true
+    collection_interval: 3
+    use_von_neumann: true
+
+  disk_io:
+    enabled: true
+    collection_interval: 30
+    iterations: 100
+    use_von_neumann: true
+
+  memory:
+    enabled: true
+    mode: "self"          # "self" 或 "all"
+    read_size: 256
+    iterations: 50
+    collection_interval: 5
+    use_hash_stir: true
+
+  disk_stats:
+    enabled: true
+    collection_interval: 3
+    use_hash_stir: true
+
+  temperature:
+    enabled: true
+    collection_interval: 10
+    use_hash_stir: true
+
+  tpm:
+    enabled: true
+    collection_interval: 60
+    use_pcr: true
+    use_rng: true
+
+  system:
+    enabled: true
+    collection_interval: 10
+
+  # === 新增: 内容熵源（各平台最新内容） ===
+  content:
+    enabled: true
+    collection_interval: 300      # 采集间隔（秒）
+    buffer_size: 500              # 内容缓冲区大小
+    mix_count: 10                 # 每次从缓冲区抽取混入的数量
+    request_timeout: 15           # 请求超时
+    min_interval: 2.0             # 平台间最小请求间隔（秒）
+    platforms:
+      weibo: true
+      zhihu: true
+      bilibili: true
+      github: true
+      hackernews: true
+      baidu: true
+
+# === 熵处理 ===
+entropy_processing:
+  global_von_neumann: false
+  hash_algorithm: "sha256"
+
+# === TCP 种子服务 ===
+tcp_server:
+  enabled: true
+  host: "0.0.0.0"
+  port: 18888
+
+# === 调度配置 ===
+scheduler:
+  network_quiet_duration: 20
+  startup_delay: 3
+
+# === 日志 ===
+logging:
+  level: "INFO"
+  file: null
