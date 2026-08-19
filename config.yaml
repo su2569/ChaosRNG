@@ -9,7 +9,7 @@ permissions:
 onebot:
   enabled: true
   ws_url: "ws://127.0.0.1:3001/"
-  access_token: "1919810"
+  access_token: "114514"
   reconnect_interval: 5
   heartbeat_interval: 30
   self_id: null
