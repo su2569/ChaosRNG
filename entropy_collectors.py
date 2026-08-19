@@ -287,13 +287,25 @@ class CameraEntropyCollector:
         self._total_bits = 0
         self._device_found = True  # 首次失败后设为 False，停止后续尝试
 
-        # 检查 opencv 可用性
+        # 检查 opencv 可用性，并实际尝试打开摄像头
         try:
             import cv2
             self._cv2 = cv2
-            self._available = True
+            # 抑制 OpenCV 错误输出到控制台
+            cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
+            # 实际尝试打开摄像头，验证设备是否存在
+            cap = cv2.VideoCapture(device_id)
+            if cap.isOpened():
+                cap.release()
+                self._available = True
+            else:
+                cap.release()
+                self._available = False
+                self._device_found = False
+                logger.warning(f"摄像头设备 {device_id} 不存在，已禁用摄像头熵源")
         except ImportError:
             self._available = False
+            self._device_found = False
 
     @property
     def available(self) -> bool:
@@ -307,22 +319,27 @@ class CameraEntropyCollector:
         loop = asyncio.get_event_loop()
 
         def _capture():
-            cap = self._cv2.VideoCapture(self.device_id)
-            if not cap.isOpened():
+            try:
+                # 抑制 OpenCV 日志输出
+                self._cv2.setLogLevel(self._cv2.LOG_LEVEL_SILENT)
+                cap = self._cv2.VideoCapture(self.device_id)
+                if not cap.isOpened():
+                    cap.release()
+                    return None
+
+                # 读取几帧让自动曝光稳定
+                for _ in range(5):
+                    cap.read()
+
+                ret, frame = cap.read()
                 cap.release()
+
+                if not ret or frame is None:
+                    return None
+
+                return frame
+            except Exception:
                 return None
-
-            # 读取几帧让自动曝光稳定
-            for _ in range(5):
-                cap.read()
-
-            ret, frame = cap.read()
-            cap.release()
-
-            if not ret or frame is None:
-                return None
-
-            return frame
 
         try:
             frame = await loop.run_in_executor(None, _capture)
@@ -330,7 +347,7 @@ class CameraEntropyCollector:
                 # 首次失败：设备不存在，禁用后续采集
                 if self._device_found:
                     self._device_found = False
-                    logger.warning(f"摄像头设备 {self.device_id} 不存在，已禁用摄像头熵源")
+                    logger.warning(f"摄像头设备 {self.device_id} 不可用，已禁用摄像头熵源")
                 return 0
 
             # 方法1: 取每个像素RGB的LSB

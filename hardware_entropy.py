@@ -606,7 +606,7 @@ class HardwareTemperatureCollector:
         # 方法2: wmic
         try:
             result = subprocess.run(
-                ["wmic", "/namespace:\\root\wmi", "PATH", "MSAcpi_ThermalZoneTemperature", "GET", "CurrentTemperature"],
+                ["wmic", r"/namespace:\\root\wmi", "PATH", "MSAcpi_ThermalZoneTemperature", "GET", "CurrentTemperature"],
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
