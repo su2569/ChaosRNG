@@ -85,12 +85,12 @@ class HashWhirlpool:
 # ====================================================================
 class ChaosEntropyPool:
     def __init__(self, hash_algorithm: str = "sha256"):
-        self._hasher = hashlib.sha256()
-        self._whirlpool = HashWhirlpool(hash_algorithm)
-        self._mix(str(time.perf_counter_ns()))
         self._event_count = 0
         self._last_mix_time = time.time()
         self._start_time = time.time()
+        self._hasher = hashlib.sha256()
+        self._whirlpool = HashWhirlpool(hash_algorithm)
+        self._mix(str(time.perf_counter_ns()))
 
     def _mix(self, data: str) -> None:
         self._hasher.update(data.encode('utf-8'))

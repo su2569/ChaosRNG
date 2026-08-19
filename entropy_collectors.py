@@ -285,6 +285,7 @@ class CameraEntropyCollector:
         self._cap = None
         self._running = False
         self._total_bits = 0
+        self._device_found = True  # 首次失败后设为 False，停止后续尝试
 
         # 检查 opencv 可用性
         try:
@@ -300,7 +301,7 @@ class CameraEntropyCollector:
 
     async def collect_once(self) -> int:
         """采集一帧暗电流噪声"""
-        if not self.available:
+        if not self.available or not self._device_found:
             return 0
 
         loop = asyncio.get_event_loop()
@@ -326,6 +327,10 @@ class CameraEntropyCollector:
         try:
             frame = await loop.run_in_executor(None, _capture)
             if frame is None:
+                # 首次失败：设备不存在，禁用后续采集
+                if self._device_found:
+                    self._device_found = False
+                    logger.warning(f"摄像头设备 {self.device_id} 不存在，已禁用摄像头熵源")
                 return 0
 
             # 方法1: 取每个像素RGB的LSB
@@ -368,7 +373,7 @@ class CameraEntropyCollector:
     async def start_daemon(self, interval_sec: float = 10.0):
         """后台持续采集"""
         self._running = True
-        while self._running:
+        while self._running and self._device_found:
             await self.collect_once()
             await asyncio.sleep(interval_sec)
 

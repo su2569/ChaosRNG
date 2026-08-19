@@ -9,7 +9,7 @@ permissions:
 onebot:
   enabled: true
   ws_url: "ws://127.0.0.1:3001/"
-  access_token: ""
+  access_token: "1919810"
   reconnect_interval: 5
   heartbeat_interval: 30
   self_id: null
@@ -24,6 +24,8 @@ packet_capture:
   duration: 15
   max_payload: 256
   prefer_scapy: true
+  # Windows Npcap/WinPcap 安装路径（null=自动搜索注册表）
+  npcap_path: null
 
 # === 扩展熵源采集 ===
 entropy_sources:

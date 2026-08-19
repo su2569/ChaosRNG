@@ -55,7 +55,8 @@ class PacketCollector:
         filter_expr: str = "tcp or udp",
         capture_duration: float = 15.0,
         max_payload: int = 256,
-        prefer_scapy: bool = True
+        prefer_scapy: bool = True,
+        npcap_path: Optional[str] = None
     ):
         self.pool = pool
         self.interface = interface
@@ -63,37 +64,128 @@ class PacketCollector:
         self.capture_duration = capture_duration
         self.max_payload = max_payload
         self.prefer_scapy = prefer_scapy
+        self.npcap_path = npcap_path
 
         self._capturing = False
         self._packets_captured = 0
         self._total_packets = 0
+
+        # Windows: 尝试设置 Npcap/WinPcap 路径
+        if platform.system().lower() == "windows":
+            self._setup_windows_npcap()
 
         # 确定使用哪种后端
         self._backend = self._detect_backend()
         if self._backend == "none":
             logger.warning("无可用抓包后端，抓包功能将不可用")
 
+
+    def _setup_windows_npcap(self):
+        """Windows: 搜索并设置 Npcap/WinPcap 路径"""
+        import platform
+        if platform.system().lower() != "windows":
+            return
+
+        if self.npcap_path and os.path.exists(self.npcap_path):
+            os.environ["SCAPY_INSTALL_ROOT"] = self.npcap_path
+            logger.info(f"使用指定 Npcap 路径: {self.npcap_path}")
+            return
+
+        # 常见安装路径（按优先级排序）
+        common_paths = [
+            r"C:\Program Files\Npcap",
+            r"C:\Program Files (x86)\Npcap",
+            r"C:\Windows\System32\Npcap",
+            r"C:\Program Files\WinPcap",
+            r"C:\Windows\System32\drivers",
+        ]
+
+        # 用户虚拟存储路径
+        user_profile = os.environ.get("USERPROFILE", "")
+        if user_profile:
+            common_paths.append(
+                os.path.join(user_profile, r"AppData\Local\VirtualStore\Program Files\Npcap")
+            )
+
+        # 从注册表读取安装路径
+        try:
+            import winreg
+            reg_paths = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Npcap"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Npcap"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WinPcap"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\WinPcap"),
+            ]
+            for hkey, reg_path in reg_paths:
+                try:
+                    key = winreg.OpenKey(hkey, reg_path)
+                    install_path, _ = winreg.QueryValueEx(key, "")
+                    if install_path and os.path.exists(install_path):
+                        common_paths.insert(0, install_path)
+                    winreg.CloseKey(key)
+                except (FileNotFoundError, OSError):
+                    pass
+        except ImportError:
+            pass
+
+        # 搜索路径
+        for path in common_paths:
+            if os.path.exists(path):
+                # 检查 wpcap.dll 或 npcap.sys
+                for check_file in ["wpcap.dll", "npcap.sys", "Packet.dll", "NPFInstall.exe"]:
+                    check_path = os.path.join(path, check_file)
+                    if os.path.exists(check_path):
+                        os.environ["SCAPY_INSTALL_ROOT"] = path
+                        # 关键: 将 Npcap 目录添加到系统 PATH，让 scapy 能找到 DLL
+                        if path not in os.environ.get("PATH", ""):
+                            os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+                        logger.info(f"找到 Npcap/WinPcap: {path} ({check_file})")
+                        return
+
+        logger.warning("未找到 Npcap/WinPcap，Windows 抓包可能不可用。请从 https://npcap.com/ 安装")
+
+    def _try_import_scapy(self) -> bool:
+        """尝试导入 scapy（在设置 Npcap 路径后）"""
+        global SCAPY_AVAILABLE
+        if SCAPY_AVAILABLE:
+            return True
+        try:
+            import sys
+            # 清除 scapy 导入缓存，强制重新加载
+            for mod_name in list(sys.modules.keys()):
+                if mod_name == 'scapy' or mod_name.startswith('scapy.'):
+                    del sys.modules[mod_name]
+            from scapy.all import sniff, Raw
+            SCAPY_AVAILABLE = True
+            logger.info("✅ scapy 延迟导入成功")
+            return True
+        except Exception as e:
+            logger.warning(f"scapy 导入失败: {e}")
+            logger.warning("请确保已安装: pip install scapy")
+            return False
+
     def _detect_backend(self) -> str:
         """检测可用的抓包后端"""
+        # Windows: 如果之前 scapy 导入失败，但找到了 Npcap，重新尝试
+        if platform.system().lower() == "windows":
+            if not SCAPY_AVAILABLE:
+                self._try_import_scapy()
+            if SCAPY_AVAILABLE:
+                logger.info("使用 scapy 作为抓包后端")
+                return "scapy"
+            # Windows 不支持原始 socket 抓包 (无 AF_PACKET)
+            logger.warning("Windows 上无 scapy，抓包不可用")
+            return "none"
+
+        # Linux/macOS
         if self.prefer_scapy and SCAPY_AVAILABLE:
             logger.info("使用 scapy 作为抓包后端")
             return "scapy"
 
-        # 检查原始 socket 权限
-        if platform.system().lower() == "windows":
-            # Windows 原始 socket 需要管理员权限
-            try:
-                import ctypes
-                if ctypes.windll.shell32.IsUserAnAdmin():
-                    logger.info("使用原始 socket 作为抓包后端（Windows Admin）")
-                    return "raw_socket"
-            except Exception:
-                pass
-        else:
-            # Linux/macOS 原始 socket 需要 root
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
-                logger.info("使用原始 socket 作为抓包后端（root）")
-                return "raw_socket"
+        # 检查原始 socket 权限 (Linux/macOS only)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            logger.info("使用原始 socket 作为抓包后端（root）")
+            return "raw_socket"
 
         logger.warning("无足够权限进行抓包，scapy 和原始 socket 均不可用")
         return "none"
@@ -179,7 +271,11 @@ class PacketCollector:
         await loop.run_in_executor(None, _sniff)
 
     async def _capture_raw_socket(self):
-        """使用原始 socket 抓包（备用方案）"""
+        """使用原始 socket 抓包（备用方案，Linux/macOS only）"""
+        import platform
+        if platform.system().lower() == "windows":
+            logger.error("Windows 不支持原始 socket 抓包，请安装 scapy + Npcap/WinPcap")
+            return
         try:
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
             if self.interface:

@@ -241,7 +241,8 @@ class ChaosRNGController:
                     filter_expr=pc_cfg.get("filter", "tcp or udp"),
                     capture_duration=pc_cfg.get("duration", 15),
                     max_payload=pc_cfg.get("max_payload", 256),
-                    prefer_scapy=pc_cfg.get("prefer_scapy", True)
+                    prefer_scapy=pc_cfg.get("prefer_scapy", True),
+                    npcap_path=pc_cfg.get("npcap_path")
                 )
                 if pc.available:
                     self.modules["packet"] = pc
@@ -635,14 +636,192 @@ class ChaosRNGController:
                     logging.getLogger("chaos_rng").debug(f"内容混入失败: {e}")
 
     # ---------- TCP ----------
-    async def _start_tcp_server(self, host: str, port: int):
+    def _register_firewall(self, port: int) -> bool:
+        """
+        自动注册防火墙规则，允许 TCP 端口通过
+
+        支持平台：
+        - Windows: netsh advfirewall
+        - Linux: firewalld → ufw → iptables
+        - macOS: pfctl (仅提示，需手动)
+        """
+        import platform
+        import subprocess
+        system = platform.system().lower()
+        logger = logging.getLogger("chaos_rng")
+
+        if system == "windows":
+            return self._register_firewall_windows(port, logger)
+        elif system == "linux":
+            return self._register_firewall_linux(port, logger)
+        elif system == "darwin":
+            logger.info("🛡️ macOS 防火墙需手动配置: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add $(which python)")
+            return True  # macOS 通常不阻止本地绑定
+        return True
+
+    def _register_firewall_windows(self, port: int, logger) -> bool:
         try:
-            server = await asyncio.start_server(self._handle_client, host, port)
-            logging.getLogger("chaos_rng").info(f"🌐 TCP {host}:{port}")
-            async with server:
-                await server.serve_forever()
+            rule_name = f"ChaosRNG_TCP_{port}"
+            check = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+                capture_output=True, text=True, timeout=10
+            )
+            if "找不到" not in check.stdout and "No rules" not in check.stdout:
+                logger.debug(f"防火墙规则 {rule_name} 已存在")
+                return True
+
+            result = subprocess.run(
+                [
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name={rule_name}", "dir=in", "action=allow",
+                    "protocol=tcp", f"localport={port}", "profile=any"
+                ],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                logger.info(f"🛡️ Windows 防火墙规则已注册: {rule_name}")
+                return True
+            else:
+                logger.warning(f"Windows 防火墙注册失败: {result.stderr.strip()}")
+                return False
         except Exception as e:
-            logging.getLogger("chaos_rng").error(f"TCP失败: {e}")
+            logger.warning(f"Windows 防火墙注册异常: {e}")
+            return False
+
+    def _register_firewall_linux(self, port: int, logger) -> bool:
+        """Linux: 尝试 firewalld → ufw → iptables"""
+
+        # 1. 尝试 firewalld (RHEL/CentOS/Fedora)
+        try:
+            result = subprocess.run(
+                ["firewall-cmd", "--state"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                # firewalld 正在运行
+                zone_result = subprocess.run(
+                    ["firewall-cmd", "--get-default-zone"],
+                    capture_output=True, text=True, timeout=5
+                )
+                zone = zone_result.stdout.strip() if zone_result.returncode == 0 else "public"
+
+                add_result = subprocess.run(
+                    [
+                        "firewall-cmd", "--permanent", f"--zone={zone}",
+                        "--add-port", f"{port}/tcp"
+                    ],
+                    capture_output=True, text=True, timeout=10
+                )
+                if add_result.returncode == 0:
+                    # 重载生效
+                    subprocess.run(
+                        ["firewall-cmd", "--reload"],
+                        capture_output=True, timeout=10
+                    )
+                    logger.info(f"🛡️ firewalld 规则已注册: {port}/tcp (zone={zone})")
+                    return True
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"firewalld 注册失败: {e}")
+
+        # 2. 尝试 ufw (Ubuntu/Debian)
+        try:
+            result = subprocess.run(
+                ["ufw", "status"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and "Status: active" in result.stdout:
+                add_result = subprocess.run(
+                    ["ufw", "allow", f"{port}/tcp"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if add_result.returncode == 0:
+                    logger.info(f"🛡️ ufw 规则已注册: {port}/tcp")
+                    return True
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"ufw 注册失败: {e}")
+
+        # 3. 尝试 iptables (通用)
+        try:
+            result = subprocess.run(
+                ["iptables", "-L", "-n"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                # 检查是否已有规则
+                check = subprocess.run(
+                    ["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if check.returncode == 0:
+                    logger.debug(f"iptables 规则 {port}/tcp 已存在")
+                    return True
+
+                add_result = subprocess.run(
+                    ["iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if add_result.returncode == 0:
+                    logger.info(f"🛡️ iptables 规则已注册: {port}/tcp")
+                    return True
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"iptables 注册失败: {e}")
+
+        logger.warning("Linux 防火墙注册失败 (firewalld/ufw/iptables 均不可用)")
+        return False
+
+    async def _start_tcp_server(self, host: str, port: int, max_port_try: int = 10):
+        logger = logging.getLogger("chaos_rng")
+        original_port = port
+
+        # Windows: 尝试注册防火墙规则
+        if platform.system().lower() == "windows":
+            fw_ok = await asyncio.get_event_loop().run_in_executor(
+                None, self._register_firewall, port
+            )
+            if not fw_ok and host == "0.0.0.0":
+                logger.warning("防火墙注册失败，回退到 127.0.0.1")
+                host = "127.0.0.1"
+
+        for attempt in range(max_port_try):
+            current_port = port + attempt
+            try:
+                server = await asyncio.start_server(
+                    self._handle_client, host, current_port,
+                    reuse_address=True
+                )
+                logger.info(f"🌐 TCP {host}:{current_port}")
+                async with server:
+                    await server.serve_forever()
+                return
+            except PermissionError:
+                if host == "0.0.0.0" and attempt == 0:
+                    logger.warning(f"绑定 {host}:{current_port} 权限不足，回退到 127.0.0.1")
+                    host = "127.0.0.1"
+                else:
+                    logger.warning(f"绑定 {host}:{current_port} 权限不足，尝试端口 {current_port + 1}")
+            except OSError as e:
+                if e.errno == 10013:  # WSAEACCES
+                    if attempt == 0 and host == "0.0.0.0":
+                        logger.warning(f"端口 {current_port} 被防火墙阻止，回退到 127.0.0.1")
+                        host = "127.0.0.1"
+                    else:
+                        logger.warning(f"端口 {current_port} 被阻止，尝试 {current_port + 1}")
+                elif e.errno == 10048:  # WSAEADDRINUSE
+                    logger.warning(f"端口 {current_port} 已被占用，尝试 {current_port + 1}")
+                else:
+                    logger.error(f"TCP失败: {e}")
+                    break
+            except Exception as e:
+                logger.error(f"TCP失败: {e}")
+                break
+
+        logger.error(f"TCP 服务无法启动，已尝试端口 {original_port} ~ {original_port + max_port_try - 1}")
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info('peername')

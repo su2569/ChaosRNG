@@ -597,7 +597,7 @@ class HardwareTemperatureCollector:
         # 方法1: WMI
         try:
             import wmi
-            w = wmi.WMI(namespace="root\wmi")
+            w = wmi.WMI(namespace=r"root\wmi")
             for sensor in w.MSAcpi_ThermalZoneTemperature():
                 temps[f"thermal_zone_{sensor.InstanceName}"] = (sensor.CurrentTemperature - 2732) / 10.0
         except:

@@ -73,28 +73,36 @@ class OneBotV11Client:
         return WEBSOCKETS_AVAILABLE
 
     async def start(self):
-        """启动客户端，自动重连"""
+        """启动客户端，自动重连（最多5次）"""
         if not WEBSOCKETS_AVAILABLE:
             logger.error("websockets 库未安装，无法启动 OneBot 客户端")
             return
 
         self._running = True
+        retry_count = 0
+        max_retries = 5
 
         # 启动自动采集任务
         if self.auto_collect:
             self._auto_collect_task = asyncio.create_task(self._auto_collect_loop())
 
-        while self._running:
+        while self._running and retry_count < max_retries:
             try:
                 await self._connect()
+                retry_count = 0  # 连接成功后重置计数
                 if self._receive_task:
                     await self._receive_task
             except Exception as e:
-                logger.error(f"OneBot 连接异常: {e}")
+                retry_count += 1
+                logger.error(f"OneBot 连接异常 ({retry_count}/{max_retries}): {e}")
 
-            if self._running:
+            if self._running and retry_count < max_retries:
                 logger.info(f"{self.reconnect_interval}秒后重连...")
                 await asyncio.sleep(self.reconnect_interval)
+
+        if retry_count >= max_retries:
+            logger.error(f"OneBot 重连次数已达上限 ({max_retries})，停止重连")
+            self._running = False
 
     async def _connect(self):
         """建立 WebSocket 连接"""
@@ -103,7 +111,7 @@ class OneBotV11Client:
             headers["Authorization"] = f"Bearer {self.access_token}"
 
         logger.info(f"正在连接 OneBot: {self.ws_url}")
-        self.ws = await websockets.connect(self.ws_url, extra_headers=headers)
+        self.ws = await websockets.connect(self.ws_url, additional_headers=headers)
         self._connected = True
         logger.info("OneBot WebSocket 连接成功")
 
@@ -114,7 +122,7 @@ class OneBotV11Client:
         """心跳循环"""
         while self._running and self._connected:
             try:
-                if self.ws and self.ws.open:
+                if self.ws and self.ws.close_code is None:
                     heartbeat = {
                         "post_type": "meta_event",
                         "meta_event_type": "heartbeat",
@@ -133,7 +141,7 @@ class OneBotV11Client:
         """接收消息循环"""
         while self._running and self._connected:
             try:
-                if self.ws and self.ws.open:
+                if self.ws and self.ws.close_code is None:
                     message = await self.ws.recv()
                     await self._handle_message(message)
             except websockets.exceptions.ConnectionClosed:
