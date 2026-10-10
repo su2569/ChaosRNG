@@ -1,0 +1,37 @@
+# 编译产物
+chaos_rng.exe
+chaos_rng
+*.exe
+*.test
+*.out
+*.dll
+*.so
+*.dylib
+
+# 本地配置（含 token，别推）
+config.json
+config.local.json
+*.local.json
+
+# 旧代码
+old/
+Old/
+OLD/
+
+# 日志 / 临时
+*.log
+logs/
+tmp/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
