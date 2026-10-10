@@ -1,0 +1,33 @@
+Chaos RNG - NOTICE
+==================
+
+This project uses the following open standards, protocols, and APIs:
+
+1. OneBot V11 Protocol
+   - https://github.com/botuniverse/onebot-11
+   - MIT License
+
+2. wttr.in Weather API
+   - https://github.com/chubin/wttr.in
+   - Apache-2.0 License
+
+3. Standard Cryptographic Algorithms
+   - SHA-256, SHA3-256: NIST FIPS 180-4 / FIPS 202 (public domain algorithms)
+   - AES-256: NIST FIPS 197 (public domain algorithm)
+   - BLAKE2b: RFC 7693 (public domain algorithm)
+
+4. Von Neumann Extractor
+   - Published in "Various techniques used in connection with random digits" (1951)
+   - Public domain algorithm
+
+Third-Party Python Libraries (user-installed dependencies):
+- pyyaml, psutil, aiohttp, websockets, cryptography, scapy
+- sounddevice / pyaudio, opencv-python, pynput
+- pywin32, wmi (Windows only)
+
+All third-party libraries retain their respective licenses.
+
+No proprietary code, trade secrets, or copyrighted material from commercial
+random number generators or security products has been used in this project.
+
+All source code in this repository is original work by the author(s).

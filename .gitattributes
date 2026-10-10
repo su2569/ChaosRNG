@@ -1,0 +1,30 @@
+# 所有文本文件自动识别，统一使用 LF 换行符
+* text=auto eol=lf
+
+# 显式声明各类文本文件
+*.py    text eol=lf
+*.go    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.ini   text eol=lf
+*.cfg   text eol=lf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制文件不做转换
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.zip   binary
+*.tar   binary
+*.gz    binary
+*.7z    binary

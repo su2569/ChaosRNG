@@ -1,0 +1,48 @@
+# ===== 本次要忽略的旧代码目录 =====
+old/
+Old/
+OLD/
+**/old/
+**/Old/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== 配置文件（可能含 token / 本机路径，不推公开仓库）=====
+config.yaml
+config.json
+config.local.yaml
+*.local.yaml
+
+# ===== 编译产物 =====
+chaos_rng.exe
+chaos_push_client.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ===== 日志 / 缓存 =====
+*.log
+logs/
+cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
