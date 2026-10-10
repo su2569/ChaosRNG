@@ -21,6 +21,14 @@ Chaos RNG 独立程序（全熵源版）
   ⚙️ system      - 系统调度/会话/事件
   📰 content     - 各平台最新内容（缓冲采集）
   📱 termux      - Termux 传感器（仅 Android/Termux）
+
+命令行参数：
+  -c, --config PATH      配置文件路径（默认 config.yaml）
+  --no-elevate           不自动提权
+  --elevated             内部标记（提权后的进程）
+  --no-shell             无交互控制台
+  --tcp-host HOST        覆盖 config.yaml 里的 tcp_server.host
+  --tcp-port PORT        覆盖 config.yaml 里的 tcp_server.port
 """
 
 import os
@@ -231,6 +239,8 @@ class ChaosRNGController:
             except Exception as e:
                 logger.warning(f"进程采集失败: {e}")
                 self.capabilities["process"] = False
+        else:
+            self.capabilities["process"] = False
 
         # 2. 天气
         if src_cfg.get("weather", {}).get("enabled", True):
@@ -246,6 +256,11 @@ class ChaosRNGController:
             except ImportError:
                 logger.warning("aiohttp 未安装，天气禁用")
                 self.capabilities["weather"] = False
+            except Exception as e:
+                logger.warning(f"天气采集加载失败: {e}")
+                self.capabilities["weather"] = False
+        else:
+            self.capabilities["weather"] = False
 
         # 3. 抓包
         pc_cfg = self.config.get("packet_capture", {})
@@ -298,6 +313,9 @@ class ChaosRNGController:
                     self.capabilities["onebot"] = False
             except ImportError:
                 logger.warning("websockets 未安装，OneBot 禁用")
+                self.capabilities["onebot"] = False
+            except Exception as e:
+                logger.warning(f"OneBot 加载失败: {e}")
                 self.capabilities["onebot"] = False
         else:
             self.capabilities["onebot"] = False
@@ -492,7 +510,6 @@ class ChaosRNGController:
                         self.capabilities["termux"] = False
                         logger.warning("Termux 传感器不可用（termux-api 未安装或权限不足）")
                 else:
-                    # 非 Termux 环境，静默跳过
                     self.capabilities["termux"] = False
             except Exception as e:
                 logger.warning(f"Termux 传感器加载失败: {e}")
@@ -1104,7 +1121,6 @@ async def interactive_shell(ctrl: ChaosRNGController):
                 continue
             if "termux" in ctrl.modules:
                 tsc = ctrl.modules["termux"]
-                # 显示传感器清单
                 sensors = tsc.sensor_list()
                 if sensors:
                     print(f"📱 发现 {len(sensors)} 个传感器:")
@@ -1112,12 +1128,10 @@ async def interactive_shell(ctrl: ChaosRNGController):
                         print(f"  {i:2d}. {s}")
                 else:
                     print("（无传感器）")
-                # 若带 scan 参数，强制扫描一次
                 if cmd == "termux scan" or cmd == "termux s":
                     bits = await tsc.collect_once()
                     print(f"📡 已扫描并混入 {bits} bits")
             else:
-                # 模块未初始化（可能 termux-api 缺失），尝试一次性扫描
                 bits = await scan_all_sensors(ctrl.pool, use_hash_stir=True)
                 if bits > 0:
                     print(f"📡 已扫描并混入 {bits} bits")
@@ -1153,14 +1167,34 @@ async def interactive_shell(ctrl: ChaosRNGController):
 # 入口
 # ====================================================================
 async def main():
-    parser = argparse.ArgumentParser(description="Chaos RNG 全熵源版")
-    parser.add_argument("-c", "--config", default="config.yaml")
-    parser.add_argument("--no-elevate", action="store_true")
-    parser.add_argument("--elevated", action="store_true")
-    parser.add_argument("--no-shell", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Chaos RNG 全熵源版",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-c", "--config", default="config.yaml",
+                        help="配置文件路径（默认 config.yaml）")
+    parser.add_argument("--no-elevate", action="store_true",
+                        help="不自动提权")
+    parser.add_argument("--elevated", action="store_true",
+                        help="内部标记（提权后的进程）")
+    parser.add_argument("--no-shell", action="store_true",
+                        help="无交互控制台")
+    parser.add_argument("--tcp-host", default=None,
+                        help="TCP 监听地址（覆盖 config.yaml 里的 tcp_server.host）")
+    parser.add_argument("--tcp-port", type=int, default=None,
+                        help="TCP 监听端口（覆盖 config.yaml 里的 tcp_server.port）")
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    # 命令行覆盖 config 里的 TCP 监听
+    if args.tcp_host is not None or args.tcp_port is not None:
+        config.setdefault("tcp_server", {})
+        if args.tcp_host is not None:
+            config["tcp_server"]["host"] = args.tcp_host
+        if args.tcp_port is not None:
+            config["tcp_server"]["port"] = args.tcp_port
+
     handle_elevation(config, args)
     setup_logging(config.get("logging", {}))
 
