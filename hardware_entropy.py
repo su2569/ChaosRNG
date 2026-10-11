@@ -294,13 +294,10 @@ class DiskIOStatsCollector:
     """
     硬盘实时读写量熵采集器
 
-    采集来源：
-    - 磁盘读写字节数的实时变化
-    - 读写操作次数的抖动
-    - 读写时间的微秒级差异
-    - 各分区的IO统计差异
-
-    依赖: psutil (磁盘IO计数器)
+    Termux / Android 兼容版本：
+      1. 优先 psutil（桌面 Linux/Windows）
+      2. 回退 /proc/diskstats（Linux 通用）
+      3. 回退 /proc/self/io（Android/Termux 一定可读）
     """
 
     def __init__(self, pool, use_hash_stir: bool = True):
@@ -308,119 +305,159 @@ class DiskIOStatsCollector:
         self.use_hash_stir = use_hash_stir
         self._running = False
         self._total_bits = 0
-        self._last_disk_io = None
-        self._system = platform.system().lower()
+        self._read_count = 0
+        self._last_snapshot = None
+        self._backend = None  # "psutil" | "proc_diskstats" | "proc_self_io"
+
+        # 探测可用后端
+        self._backend = self._detect_backend()
+        if self._backend:
+            logger.info(f"📊 磁盘统计后端: {self._backend}")
+
+    def _detect_backend(self):
+        """探测可用后端"""
+        # 1. psutil
+        try:
+            import psutil
+            io = psutil.disk_io_counters(perdisk=False)
+            if io is not None:
+                return "psutil"
+        except Exception:
+            pass
+
+        # 2. /proc/diskstats
+        try:
+            with open("/proc/diskstats", "rb") as f:
+                if f.read(64):
+                    return "proc_diskstats"
+        except Exception:
+            pass
+
+        # 3. /proc/self/io
+        try:
+            with open("/proc/self/io", "rb") as f:
+                if f.read(64):
+                    return "proc_self_io"
+        except Exception:
+            pass
+
+        return None
 
     @property
     def available(self) -> bool:
-        try:
-            import psutil
-            psutil.disk_io_counters()
-            return True
-        except:
-            return False
-
-    async def collect_once(self) -> int:
-        """采集一次磁盘IO统计"""
-        try:
-            import psutil
-            loop = asyncio.get_event_loop()
-
-            def _read():
-                data = {}
-
-                # 总体磁盘IO
-                io = psutil.disk_io_counters(perdisk=False)
-                if io:
-                    data["total"] = {
-                        "read_bytes": io.read_bytes,
-                        "write_bytes": io.write_bytes,
-                        "read_count": io.read_count,
-                        "write_count": io.write_count,
-                        "read_time": io.read_time,
-                        "write_time": io.write_time,
-                    }
-
-                # 各磁盘IO
-                perdisk = psutil.disk_io_counters(perdisk=True)
-                if perdisk:
-                    for disk_name, disk_io in perdisk.items():
-                        data[disk_name] = {
-                            "read_bytes": disk_io.read_bytes,
-                            "write_bytes": disk_io.write_bytes,
-                            "read_count": disk_io.read_count,
-                            "write_count": disk_io.write_count,
-                            "read_time": disk_io.read_time,
-                            "write_time": disk_io.write_time,
-                        }
-
-                # 分区使用情况（增加抖动）
-                partitions = psutil.disk_partitions(all=False)
-                for part in partitions:
-                    try:
-                        usage = psutil.disk_usage(part.mountpoint)
-                        data[f"usage_{part.device}"] = {
-                            "total": usage.total,
-                            "used": usage.used,
-                            "free": usage.free,
-                            "percent": usage.percent,
-                        }
-                    except:
-                        pass
-
-                return data
-
-            current_io = await loop.run_in_executor(None, _read)
-
-            # 计算差值（抖动）
-            if self._last_disk_io:
-                jitter_data = {}
-                for key in current_io:
-                    if key in self._last_disk_io:
-                        curr = current_io[key]
-                        prev = self._last_disk_io[key]
-                        jitter = {}
-                        for subkey in curr:
-                            if subkey in prev:
-                                jitter[subkey] = curr[subkey] - prev[subkey]
-                        jitter_data[key] = jitter
-
-                # 混入差值
-                json_str = json.dumps(jitter_data, sort_keys=True)
-                hash_result = hashlib.sha256(
-                    f"disk_io:{json_str}:{time.perf_counter_ns()}".encode()
-                ).digest()
-                self.pool.mix_bytes(hash_result)
-                self._total_bits += len(hash_result) * 8
-                return len(hash_result) * 8
-
-            self._last_disk_io = current_io
-            return 0
-
-        except Exception as e:
-            logger.debug(f"磁盘IO采集失败: {e}")
-        return 0
-
-    async def start_daemon(self, interval_sec: float = 3.0):
-        """后台持续采集"""
-        self._running = True
-        while self._running:
-            bits = await self.collect_once()
-            if bits > 0:
-                logger.debug(f"磁盘IO采集 {bits} bits")
-            await asyncio.sleep(interval_sec)
-
-    def stop(self):
-        self._running = False
+        return self._backend is not None
 
     @property
     def total_bits(self) -> int:
         return self._total_bits
 
+    @property
+    def read_count(self) -> int:
+        return self._read_count
 
-# ====================================================================
-# 3. 硬件温度采集器
-# ====================================================================
+    def _read_psutil(self):
+        """用 psutil 读（桌面版）"""
+        import psutil
+        io = psutil.disk_io_counters(perdisk=False)
+        if io is None:
+            return None
+        data = {
+            "read_bytes": io.read_bytes,
+            "write_bytes": io.write_bytes,
+            "read_count": io.read_count,
+            "write_count": io.write_count,
+            "read_time": io.read_time,
+            "write_time": io.write_time,
+        }
+        # 各磁盘
+        try:
+            per = psutil.disk_io_counters(perdisk=True)
+            if per:
+                for name, d in per.items():
+                    data[f"disk_{name}_rb"] = d.read_bytes
+                    data[f"disk_{name}_wb"] = d.write_bytes
+        except Exception:
+            pass
+        return data
+
+    def _read_proc_diskstats(self):
+        """解析 /proc/diskstats"""
+        try:
+            with open("/proc/diskstats", "rb") as f:
+                data = f.read(8192)
+            if not data:
+                return None
+            return {"raw": data}
+        except Exception:
+            return None
+
+    def _read_proc_self_io(self):
+        """解析 /proc/self/io（本进程）"""
+        try:
+            with open("/proc/self/io", "rb") as f:
+                data = f.read(1024)
+            if not data:
+                return None
+            return {"raw": data}
+        except Exception:
+            return None
+
+    def _read_all(self):
+        """读一次完整快照"""
+        if self._backend == "psutil":
+            return self._read_psutil()
+        elif self._backend == "proc_diskstats":
+            return self._read_proc_diskstats()
+        elif self._backend == "proc_self_io":
+            return self._read_proc_self_io()
+        return None
+
+    async def collect_once(self):
+        """采集一次差分（异步包装）"""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        try:
+            current = await loop.run_in_executor(None, self._read_all)
+        except Exception as e:
+            logger.debug(f"磁盘统计采集失败: {e}")
+            return 0
+
+        if current is None:
+            return 0
+
+        # 与上次对比
+        if self._last_snapshot is not None:
+            buf = bytearray()
+            buf.extend(json.dumps(current, sort_keys=True, default=str).encode("utf-8"))
+            buf.extend(json.dumps(self._last_snapshot, sort_keys=True, default=str).encode("utf-8"))
+            buf.extend(struct.pack("<Q", time.perf_counter_ns()))
+
+            if self.use_hash_stir:
+                h = hashlib.sha256(buf).digest()
+            else:
+                h = bytes(buf[:32])
+
+            self.pool.mix_bytes(h)
+            self._total_bits += len(h) * 8
+            self._read_count += 1
+
+        self._last_snapshot = current
+        return 256
+
+    async def start_daemon(self, interval_sec: float = 3.0):
+        if not self.available:
+            return
+        self._running = True
+        while self._running:
+            try:
+                await self.collect_once()
+            except Exception as e:
+                logger.debug(f"磁盘统计 daemon 异常: {e}")
+            await asyncio.sleep(interval_sec)
+
+    def stop(self):
+        self._running = False
+
 class HardwareTemperatureCollector:
     """
     硬件温度熵采集器

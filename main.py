@@ -21,6 +21,14 @@ Chaos RNG 独立程序（全熵源版）
   ⚙️ system      - 系统调度/会话/事件
   📰 content     - 各平台最新内容（缓冲采集）
   📱 termux      - Termux 传感器（仅 Android/Termux）
+
+命令行参数：
+  -c, --config PATH      配置文件路径（默认 config.yaml）
+  --no-elevate           不自动提权
+  --elevated             内部标记（提权后的进程）
+  --no-shell             无交互控制台
+  --tcp-host HOST        覆盖 config.yaml 里的 tcp_server.host
+  --tcp-port PORT        覆盖 config.yaml 里的 tcp_server.port
 """
 
 import os
@@ -89,6 +97,17 @@ DEFAULT_CONFIG = {
     "scheduler": {"network_quiet_duration": 20, "startup_delay": 3},
     "logging": {"level": "INFO", "file": None}
 }
+
+
+def _is_termux() -> bool:
+    """检测是否为 Termux 环境"""
+    if "com.termux" in os.environ.get("PREFIX", ""):
+        return True
+    if os.environ.get("TERMUX_VERSION"):
+        return True
+    if os.path.isdir("/data/data/com.termux"):
+        return True
+    return False
 
 
 def load_config(path: str) -> dict:
@@ -231,6 +250,8 @@ class ChaosRNGController:
             except Exception as e:
                 logger.warning(f"进程采集失败: {e}")
                 self.capabilities["process"] = False
+        else:
+            self.capabilities["process"] = False
 
         # 2. 天气
         if src_cfg.get("weather", {}).get("enabled", True):
@@ -246,6 +267,11 @@ class ChaosRNGController:
             except ImportError:
                 logger.warning("aiohttp 未安装，天气禁用")
                 self.capabilities["weather"] = False
+            except Exception as e:
+                logger.warning(f"天气采集加载失败: {e}")
+                self.capabilities["weather"] = False
+        else:
+            self.capabilities["weather"] = False
 
         # 3. 抓包
         pc_cfg = self.config.get("packet_capture", {})
@@ -299,24 +325,40 @@ class ChaosRNGController:
             except ImportError:
                 logger.warning("websockets 未安装，OneBot 禁用")
                 self.capabilities["onebot"] = False
+            except Exception as e:
+                logger.warning(f"OneBot 加载失败: {e}")
+                self.capabilities["onebot"] = False
         else:
             self.capabilities["onebot"] = False
 
-        # 5. 音频
+        # 5. 音频（Termux 优先 + 前台检测）
         if src_cfg.get("audio", {}).get("enabled", True):
             try:
-                from entropy_collectors import AudioEntropyCollector
-                ac = AudioEntropyCollector(
-                    self.pool,
-                    sample_rate=src_cfg["audio"].get("sample_rate", 44100),
-                    chunk_size=src_cfg["audio"].get("chunk_size", 1024),
-                    channels=src_cfg["audio"].get("channels", 1),
-                    use_von_neumann=src_cfg["audio"].get("use_von_neumann", True)
-                )
+                if _is_termux():
+                    from foreground_check import ForegroundChecker
+                    from termux_media import TermuxMicCollector
+                    fg = ForegroundChecker(
+                        method=src_cfg.get("foreground_check", {}).get("method", "auto")
+                    )
+                    ac = TermuxMicCollector(
+                        self.pool,
+                        duration=src_cfg["audio"].get("duration", 0.3),
+                        use_hash_stir=src_cfg["audio"].get("use_hash_stir", True),
+                        foreground_checker=fg,
+                    )
+                else:
+                    from entropy_collectors import AudioEntropyCollector
+                    ac = AudioEntropyCollector(
+                        self.pool,
+                        sample_rate=src_cfg["audio"].get("sample_rate", 44100),
+                        chunk_size=src_cfg["audio"].get("chunk_size", 1024),
+                        channels=src_cfg["audio"].get("channels", 1),
+                        use_von_neumann=src_cfg["audio"].get("use_von_neumann", True),
+                    )
                 if ac.available:
                     self.modules["audio"] = ac
                     self.capabilities["audio"] = True
-                    logger.info("🎙️ 音频熵源已加载")
+                    logger.info("🎙️ 音频熵源已加载" + (" (Termux+前台检测)" if _is_termux() else ""))
                 else:
                     self.capabilities["audio"] = False
             except Exception as e:
@@ -325,19 +367,33 @@ class ChaosRNGController:
         else:
             self.capabilities["audio"] = False
 
-        # 6. 摄像头
+
+        # 6. 摄像头（Termux 优先 + 前台检测）
         if src_cfg.get("camera", {}).get("enabled", True):
             try:
-                from entropy_collectors import CameraEntropyCollector
-                cc = CameraEntropyCollector(
-                    self.pool,
-                    device_id=src_cfg["camera"].get("device_id", 0),
-                    use_von_neumann=src_cfg["camera"].get("use_von_neumann", True)
-                )
+                if _is_termux():
+                    from foreground_check import ForegroundChecker
+                    from termux_media import TermuxCameraCollector
+                    fg = ForegroundChecker(
+                        method=src_cfg.get("foreground_check", {}).get("method", "auto")
+                    )
+                    cc = TermuxCameraCollector(
+                        self.pool,
+                        camera_id=src_cfg["camera"].get("device_id", 0),
+                        use_hash_stir=src_cfg["camera"].get("use_hash_stir", True),
+                        foreground_checker=fg,
+                    )
+                else:
+                    from entropy_collectors import CameraEntropyCollector
+                    cc = CameraEntropyCollector(
+                        self.pool,
+                        device_id=src_cfg["camera"].get("device_id", 0),
+                        use_von_neumann=src_cfg["camera"].get("use_von_neumann", True),
+                    )
                 if cc.available:
                     self.modules["camera"] = cc
                     self.capabilities["camera"] = True
-                    logger.info("📷 摄像头熵源已加载")
+                    logger.info("📷 摄像头熵源已加载" + (" (Termux+前台检测)" if _is_termux() else ""))
                 else:
                     self.capabilities["camera"] = False
             except Exception as e:
@@ -345,6 +401,7 @@ class ChaosRNGController:
                 self.capabilities["camera"] = False
         else:
             self.capabilities["camera"] = False
+
 
         # 7. 输入设备
         if src_cfg.get("input", {}).get("enabled", True):
@@ -492,13 +549,30 @@ class ChaosRNGController:
                         self.capabilities["termux"] = False
                         logger.warning("Termux 传感器不可用（termux-api 未安装或权限不足）")
                 else:
-                    # 非 Termux 环境，静默跳过
                     self.capabilities["termux"] = False
             except Exception as e:
                 logger.warning(f"Termux 传感器加载失败: {e}")
                 self.capabilities["termux"] = False
         else:
             self.capabilities["termux"] = False
+
+        # 14b. Termux 附加熵源（网络 / 内核 / 时钟 / 电池 / 进程）
+        termux_extra_cfg = src_cfg.get("termux_extra", {})
+        if termux_extra_cfg.get("enabled", True):
+            try:
+                from termux_extra import build_all
+                extras = build_all(self.pool, termux_extra_cfg)
+                if not hasattr(self, "_termux_extra_intervals"):
+                    self._termux_extra_intervals = {}
+                for collector, interval in extras:
+                    name = collector.name
+                    self.modules[name] = collector
+                    self._termux_extra_intervals[name] = interval
+                    self.capabilities[name] = True
+                if extras:
+                    logger.info(f"⚡ Termux 附加熵源已加载 ({len(extras)} 个)")
+            except Exception as e:
+                logger.warning(f"Termux 附加熵源加载失败: {e}")
 
         # 15. 内容熵源
         if src_cfg.get("content", {}).get("enabled", True):
@@ -551,11 +625,11 @@ class ChaosRNGController:
             self._tasks.append(asyncio.create_task(self._weather_loop(interval)))
 
         if "audio" in self.modules:
-            interval = src_cfg["audio"].get("collection_interval", 5)
+            interval = src_cfg.get("foreground_check", {}).get("check_interval", 5)
             self._tasks.append(asyncio.create_task(self.modules["audio"].start_daemon(interval)))
 
         if "camera" in self.modules:
-            interval = src_cfg["camera"].get("collection_interval", 10)
+            interval = src_cfg.get("foreground_check", {}).get("check_interval", 5)
             self._tasks.append(asyncio.create_task(self.modules["camera"].start_daemon(interval)))
 
         if "input" in self.modules:
@@ -593,6 +667,14 @@ class ChaosRNGController:
                 asyncio.create_task(self.modules["termux"].start_daemon(interval))
             )
 
+        # Termux 附加熵源 daemon
+        intervals = getattr(self, "_termux_extra_intervals", {})
+        for _name, _interval in intervals.items():
+            if _name in self.modules:
+                self._tasks.append(asyncio.create_task(
+                    self.modules[_name].start_daemon(_interval)
+                ))
+
         if "content" in self.modules:
             self._tasks.append(asyncio.create_task(self.modules["content"].start_daemon()))
             mix_count = src_cfg["content"].get("mix_count", 10)
@@ -621,7 +703,11 @@ class ChaosRNGController:
             "process": "🔧", "weather": "🌤️", "packet": "🕸️", "onebot": "💬",
             "audio": "🎙️", "camera": "📷", "input": "🖱️", "disk_io": "💾",
             "memory": "🧠", "disk_stats": "📊", "temperature": "🌡️",
-            "tpm": "🔒", "system": "⚙️", "content": "📰", "termux": "📱"
+            "tpm": "🔒", "system": "⚙️", "content": "📰", "termux": "📱",
+            "termux_clock": "⏱️", "termux_dns": "🌐", "termux_tcp_rtt": "🌐",
+            "termux_net_if": "🌐", "termux_entropy_avail": "🎲",
+            "termux_kernel_stat": "⚙️", "termux_battery": "🔋",
+            "termux_proc_state": "🔧",
         }
         for name, ok in self.capabilities.items():
             icon = icons.get(name, "📦")
@@ -1027,6 +1113,18 @@ class ChaosRNGController:
                 "read_count": tsc.read_count,
                 "sensors": tsc.sensor_list()[:20],
             }
+
+        # Termux 附加熵源状态（自动遍历）
+        for _name in ["termux_clock", "termux_dns", "termux_tcp_rtt",
+                      "termux_net_if", "termux_entropy_avail",
+                      "termux_kernel_stat", "termux_battery",
+                      "termux_proc_state"]:
+            if _name in self.modules:
+                m = self.modules[_name]
+                status["modules"][_name] = {
+                    "total_bits": m.total_bits,
+                    "read_count": m.read_count,
+                }
         if "content" in self.modules:
             cc = self.modules["content"]
             status["modules"]["content"] = {
@@ -1104,7 +1202,6 @@ async def interactive_shell(ctrl: ChaosRNGController):
                 continue
             if "termux" in ctrl.modules:
                 tsc = ctrl.modules["termux"]
-                # 显示传感器清单
                 sensors = tsc.sensor_list()
                 if sensors:
                     print(f"📱 发现 {len(sensors)} 个传感器:")
@@ -1112,12 +1209,10 @@ async def interactive_shell(ctrl: ChaosRNGController):
                         print(f"  {i:2d}. {s}")
                 else:
                     print("（无传感器）")
-                # 若带 scan 参数，强制扫描一次
                 if cmd == "termux scan" or cmd == "termux s":
                     bits = await tsc.collect_once()
                     print(f"📡 已扫描并混入 {bits} bits")
             else:
-                # 模块未初始化（可能 termux-api 缺失），尝试一次性扫描
                 bits = await scan_all_sensors(ctrl.pool, use_hash_stir=True)
                 if bits > 0:
                     print(f"📡 已扫描并混入 {bits} bits")
@@ -1153,14 +1248,34 @@ async def interactive_shell(ctrl: ChaosRNGController):
 # 入口
 # ====================================================================
 async def main():
-    parser = argparse.ArgumentParser(description="Chaos RNG 全熵源版")
-    parser.add_argument("-c", "--config", default="config.yaml")
-    parser.add_argument("--no-elevate", action="store_true")
-    parser.add_argument("--elevated", action="store_true")
-    parser.add_argument("--no-shell", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Chaos RNG 全熵源版",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-c", "--config", default="config.yaml",
+                        help="配置文件路径（默认 config.yaml）")
+    parser.add_argument("--no-elevate", action="store_true",
+                        help="不自动提权")
+    parser.add_argument("--elevated", action="store_true",
+                        help="内部标记（提权后的进程）")
+    parser.add_argument("--no-shell", action="store_true",
+                        help="无交互控制台")
+    parser.add_argument("--tcp-host", default=None,
+                        help="TCP 监听地址（覆盖 config.yaml 里的 tcp_server.host）")
+    parser.add_argument("--tcp-port", type=int, default=None,
+                        help="TCP 监听端口（覆盖 config.yaml 里的 tcp_server.port）")
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    # 命令行覆盖 config 里的 TCP 监听
+    if args.tcp_host is not None or args.tcp_port is not None:
+        config.setdefault("tcp_server", {})
+        if args.tcp_host is not None:
+            config["tcp_server"]["host"] = args.tcp_host
+        if args.tcp_port is not None:
+            config["tcp_server"]["port"] = args.tcp_port
+
     handle_elevation(config, args)
     setup_logging(config.get("logging", {}))
 

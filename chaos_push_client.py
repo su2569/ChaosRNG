@@ -349,11 +349,41 @@ class PushSink:
             resp_line, _, rest = bytes(self._buf).partition(b"\n")
             self._buf = bytearray(rest)
 
+            # 优先尝试正常 JSON 解析
             try:
-                return json.loads(resp_line)
-            except json.JSONDecodeError:
-                logger.debug(f"响应非 JSON: {resp_line!r}")
-                return None
+                text = resp_line.decode("utf-8", errors="replace")
+                return json.loads(text)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # 网络中间设备可能篡改了部分字段（如 score），
+                # 但关键字段 "ok" / "reason" / "mixed" 通常完好。
+                # 用正则从原始字节里提取关键信息。
+                logger.debug(f"响应非 JSON: {resp_line!r} ({e})")
+                import re
+                raw = resp_line
+                m_ok = re.search(rb'"ok"\s*:\s*(true|false)', raw)
+                m_reason = re.search(rb'"reason"\s*:\s*"([^"]*)"', raw)
+                m_retry = re.search(rb'"retry_ms"\s*:\s*([0-9]+)', raw)
+                m_score = re.search(rb'"score"\s*:\s*([0-9.]+)', raw)
+                if m_ok is None and m_reason is None:
+                    # 连关键字段都没有，确实失败
+                    self._close()
+                    return None
+                result = {}
+                if m_ok:
+                    result["ok"] = (m_ok.group(1) == b"true")
+                if m_reason:
+                    result["reason"] = m_reason.group(1).decode("utf-8", errors="replace")
+                if m_retry:
+                    result["retry_ms"] = int(m_retry.group(1))
+                if m_score:
+                    try:
+                        result["score"] = float(m_score.group(1))
+                    except ValueError:
+                        pass
+                result.setdefault("ok", False)
+                result.setdefault("reason", "unknown")
+                result.setdefault("score", 0.0)
+                return result
         except OSError:
             self._close()
             return None

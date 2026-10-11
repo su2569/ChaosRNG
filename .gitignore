@@ -46,3 +46,15 @@ cache/
 .DS_Store
 Thumbs.db
 desktop.ini
+# ===== 大文件（RNG 数据/图像）=====
+rng_data.bin
+rng_*.bin
+rng_*.png
+rng_*.raw
+rng_*.rgba
+
+rng_data.bin
+rng_*.bin
+rng_*.png
+rng_*.raw
+rng_*.rgba
