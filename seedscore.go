@@ -25,17 +25,21 @@ import (
 // #5 专门用来抓递增序列 / 重复模式：这类种子在 #1~#4 上可能得分很高，
 // 但相邻字节 XOR 后必然退化成常量，熵接近 0。
 //
-// 真随机 32 字节典型得分 ≈ 85~90，阈值 65 有较大区分度。
+// 阈值策略：
+//   score < pushScoreMin(30)              -> 拒绝
+//   pushScoreMin ≤ score < pushScoreHigh  -> 先有损压缩(CondenseEntropy)再混入
+//   score ≥ pushScoreHigh(70)             -> 直接混入
 // ============================================================================
 
 const (
 	pushSeedBytes  = 32
 	pushSeedHexLen = 64
-	pushScoreMin   = 65.0 // 分数阈值
-	pushRatePerSec = 2.0  // 每秒最多 2 个
-	pushRateBurst  = 4    // 突发容量
-	pushRecentCap  = 64   // 去重环形缓冲大小
-	pushMinHamming = 40   // 与最近任一种子的最小 Hamming 距离
+	pushScoreMin   = 30.0 // 阈值放宽：纯度 <30% 才拒绝
+	pushScoreHigh  = 70.0 // 纯度 ≥70% 直接混入，否则先有损压缩
+	pushRatePerSec = 2.0
+	pushRateBurst  = 4
+	pushRecentCap  = 64
+	pushMinHamming = 40
 )
 
 // SeedScore 持有最近接受的种子，用于 Hamming 去重。
@@ -121,7 +125,6 @@ func (s *SeedScore) Score(seed []byte) (float64, bool) {
 	}
 
 	// --- 5. XOR 差分熵 ---
-	// 相邻字节两两 XOR 得到 31 字节；真随机依然高熵，模式数据必然退化。
 	diff := make([]byte, 0, pushSeedBytes-1)
 	for i := 0; i < pushSeedBytes-1; i++ {
 		diff = append(diff, seed[i]^seed[i+1])
@@ -138,7 +141,6 @@ func (s *SeedScore) Score(seed []byte) (float64, bool) {
 		p := float64(c) / float64(len(diff))
 		DH -= p * math.Log2(p)
 	}
-	// 31 字节理想的 H 略低于 5.0，归一化按 4.9 缩放
 	diffScore := DH / 4.9 * 100.0
 	if diffScore > 100 {
 		diffScore = 100
@@ -246,6 +248,10 @@ type pushResult struct {
 // pushHexSeed 处理一条 `PUSH_SEED <hex>` 请求。
 // 顺序：格式 → 评分 → 阈值 → 去重 → 全局限流 → 每连接限流 → 混池。
 // 便宜检查在前，避免无效请求消耗限流配额。
+//
+// 混池策略：
+//   score ≥ pushScoreHigh(70)  → 直接 MixBytes(raw)
+//   score <  pushScoreHigh(70) → 先 CondenseEntropy(raw) 有损压缩，再 MixBytes(cond)
 func pushHexSeed(pool *ChaosEntropyPool, perConn *pushLimiter, hexStr string) pushResult {
 	// 1. 格式校验
 	if len(hexStr) != pushSeedHexLen {
@@ -277,8 +283,18 @@ func pushHexSeed(pool *ChaosEntropyPool, perConn *pushLimiter, hexStr string) pu
 		}
 	}
 
-	// 5. 通过：记录 + 混池
+	// 5. 通过：记录 + 混池（低纯度先有损压缩）
 	globalSeedScore.Record(raw)
-	pool.MixBytes(raw)
+	if score < pushScoreHigh {
+		cond := CondenseEntropy(raw)
+		if len(cond) > 0 {
+			pool.MixBytes(cond)
+			secureZero(cond)
+		} else {
+			pool.MixBytes(raw)
+		}
+	} else {
+		pool.MixBytes(raw)
+	}
 	return pushResult{OK: true, Score: score, Reason: "accepted", Mixed: true}
 }

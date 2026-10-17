@@ -11,20 +11,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 )
 
-// TCPServer 提供 TCP 种子服务，协议兼容 Python 原版：
-//   GET_SEED          -> [4B 长度][原始种子]            任何来源可访问
-//   GET_HEX           -> hex 种子 + \n                   任何来源可访问
-//   PING              -> PONG\n                          任何来源可访问
-//   STATUS <key>      -> JSON 状态 + \n                  仅回环 + key 校验
-//   CAPS              -> 能力 JSON + \n                  任何来源可访问
-//   PUSH_SEED <hex>   -> JSON 结果 + \n                  任何来源可访问（有评分/限流）
-//
-// STATUS 双重门槛：来源必须 127.0.0.1/::1，且口令匹配（未配置 token 时回退 "114514"）。
+// TCPServer 协议（v2）：
+//   GET_SEED            -> [4B 长度][32 字节种子]           任何人
+//   GET_HEX             -> 64 hex + \n                      任何人
+//   GET_SEEDS <n>       -> n*[4B 长度][32 字节种子]         任何人（n ≤ 1024）
+//   RGBA [size]         -> [4B size][4B total][RGBA 字节流]  任何人（16 ≤ size ≤ 8192）
+//   PING                -> PONG\n                            任何人
+//   STATUS <key>        -> JSON 状态 + \n                    仅回环 + key
+//   CAPS                -> JSON 能力 + \n                    任何人
+//   PUSH_SEED <hex>     -> JSON 结果 + \n                    任何人（有评分/限流）
 type TCPServer struct {
 	pool     *ChaosEntropyPool
 	stirrer  *HashStir
@@ -40,6 +41,7 @@ type TCPServer struct {
 	seedsPushed int64
 	pushAccepts int64
 	pushRejects int64
+	rgbaServed  int64
 	cmdsTotal   int64
 
 	ln   net.Listener
@@ -114,7 +116,6 @@ func (s *TCPServer) acceptLoop() {
 	}
 }
 
-// isLoopbackAddr 判断连接是否来自本机回环（127.0.0.0/8 或 ::1）。
 func isLoopbackAddr(addr net.Addr) bool {
 	if addr == nil {
 		return false
@@ -138,7 +139,6 @@ func (s *TCPServer) handleConn(c net.Conn) {
 	r := bufio.NewReader(c)
 	w := bufio.NewWriter(c)
 
-	// 每个连接一份独立限流器；全局限流器在 seedscore.go
 	perConn := newPushLimiter(pushRatePerSec, pushRateBurst)
 
 	for {
@@ -152,6 +152,7 @@ func (s *TCPServer) handleConn(c net.Conn) {
 		atomic.AddInt64(&s.cmdsTotal, 1)
 
 		switch {
+		// ---------- GET_SEED ----------
 		case cmd == "GET_SEED":
 			seed := GenerateSeed(s.pool)
 			var lb [4]byte
@@ -162,6 +163,7 @@ func (s *TCPServer) handleConn(c net.Conn) {
 			secureZero(seed)
 			atomic.AddInt64(&s.seedsServed, 1)
 
+		// ---------- GET_HEX ----------
 		case cmd == "GET_HEX":
 			seed := GenerateSeed(s.pool)
 			w.WriteString(hex.EncodeToString(seed) + "\n")
@@ -169,12 +171,84 @@ func (s *TCPServer) handleConn(c net.Conn) {
 			secureZero(seed)
 			atomic.AddInt64(&s.seedsServed, 1)
 
+		// ---------- GET_SEEDS <n> ----------
+		case strings.HasPrefix(cmd, "GET_SEEDS"):
+			n := 16
+			parts := strings.SplitN(raw, " ", 2)
+			if len(parts) > 1 {
+				if v, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil && v >= 1 && v <= 1024 {
+					n = v
+				}
+			}
+			seeds := GenerateSeeds(s.pool, n)
+			var lb [4]byte
+			for i := 0; i < n; i++ {
+				binary.BigEndian.PutUint32(lb[:], 32)
+				w.Write(lb[:])
+				w.Write(seeds[i*32 : (i+1)*32])
+			}
+			w.Flush()
+			secureZero(seeds)
+			atomic.AddInt64(&s.seedsServed, int64(n))
+
+		// ---------- RGBA [size] ----------
+		case strings.HasPrefix(cmd, "RGBA"):
+			size := 4096
+			parts := strings.SplitN(raw, " ", 2)
+			if len(parts) > 1 {
+				if v, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+					size = v
+				}
+			}
+			// 安全钳制
+			if size < 16 {
+				size = 16
+			}
+			if size > 8192 {
+				size = 8192
+			}
+			total := size * size * 4
+
+			// 响应头: [4B size][4B total]
+			var hdr [8]byte
+			binary.BigEndian.PutUint32(hdr[0:4], uint32(size))
+			binary.BigEndian.PutUint32(hdr[4:8], uint32(total))
+			if _, err := w.Write(hdr[:]); err != nil {
+				return
+			}
+
+			// 流式分块生成（每块 1 MB）
+			const chunkBytes = 1 << 20
+			written := 0
+			for written < total {
+				remain := total - written
+				n := chunkBytes
+				if n > remain {
+					n = remain
+				}
+				seeds := (n + 31) / 32
+				data := GenerateSeeds(s.pool, seeds)
+				if len(data) < n {
+					break
+				}
+				if _, err := w.Write(data[:n]); err != nil {
+					secureZero(data)
+					return
+				}
+				secureZero(data)
+				written += n
+			}
+			w.Flush()
+			atomic.AddInt64(&s.rgbaServed, 1)
+			atomic.AddInt64(&s.seedsServed, int64((total+31)/32))
+
+		// ---------- PING ----------
 		case cmd == "PING":
 			w.WriteString("PONG\n")
 			w.Flush()
 
+		// ---------- PUSH_SEED <hex> ----------
 		case strings.HasPrefix(cmd, "PUSH_SEED ") || cmd == "PUSH_SEED":
-			// 从原始行（保留大小写，hex 无碍）中截取参数
 			hexArg := ""
 			if len(raw) > len("PUSH_SEED ") {
 				hexArg = strings.TrimSpace(raw[len("PUSH_SEED "):])
@@ -191,6 +265,7 @@ func (s *TCPServer) handleConn(c net.Conn) {
 			w.WriteByte('\n')
 			w.Flush()
 
+		// ---------- STATUS <key> ----------
 		case strings.HasPrefix(cmd, "STATUS"):
 			if !isLoopbackAddr(c.RemoteAddr()) {
 				w.WriteString("FORBIDDEN: STATUS only from loopback (127.0.0.1 / ::1)\n")
@@ -212,14 +287,66 @@ func (s *TCPServer) handleConn(c net.Conn) {
 			w.WriteByte('\n')
 			w.Flush()
 
+		// ---------- CAPS ----------
 		case cmd == "CAPS":
 			b, _ := json.Marshal(s.caps)
 			w.Write(b)
 			w.WriteByte('\n')
 			w.Flush()
 
+		// ---------- MIX <hex> ----------
+		case strings.HasPrefix(cmd, "MIX ") || cmd == "MIX":
+			hexArg := ""
+			if len(raw) > len("MIX ") {
+				hexArg = strings.TrimSpace(raw[len("MIX "):])
+			}
+			if hexArg == "" {
+				w.WriteString("{\"ok\":false,\"reason\":\"empty\"}\n")
+				w.Flush()
+				continue
+			}
+			data, derr := hex.DecodeString(hexArg)
+			if derr != nil || len(data) == 0 {
+				w.WriteString("{\"ok\":false,\"reason\":\"bad_hex\"}\n")
+				w.Flush()
+				continue
+			}
+			if len(data) > 4096 {
+				data = data[:4096]
+			}
+			purity := ComputePurity(data)
+			if purity < purityRejectBelow {
+				secureZero(data)
+				w.WriteString(fmt.Sprintf("{\"ok\":false,\"reason\":\"low_purity\",\"purity\":%.1f}\n", purity))
+				w.Flush()
+				continue
+			}
+			// 纯度已在外部算好，直接按阈值决定用 raw 还是 condense，
+			// 绕过 MixBytesFiltered 内部重复计算。
+			var compressed []byte
+			toMix := data
+			if purity < purityHighEnough {
+				compressed = CondenseEntropy(data)
+				if len(compressed) == 0 {
+					secureZero(data)
+					w.WriteString(fmt.Sprintf("{\"ok\":false,\"reason\":\"condense_failed\",\"purity\":%.1f}\n", purity))
+					w.Flush()
+					continue
+				}
+				toMix = compressed
+			}
+			s.pool.MixBytes(toMix)
+			if compressed != nil {
+				secureZero(compressed)
+			}
+			secureZero(data)
+			w.WriteString(fmt.Sprintf("{\"ok\":true,\"purity\":%.1f}\n", purity))
+			w.Flush()
+			atomic.AddInt64(&s.seedsPushed, 1)
+			atomic.AddInt64(&s.pushAccepts, 1)
+
 		default:
-			w.WriteString("ERROR: GET_SEED GET_HEX PING STATUS <key> CAPS PUSH_SEED <hex>\n")
+			w.WriteString("ERROR: GET_SEED GET_HEX GET_SEEDS <n> RGBA [size] PING STATUS <key> CAPS PUSH_SEED <hex> MIX <hex>\n")
 			w.Flush()
 		}
 	}
@@ -261,6 +388,7 @@ func (s *TCPServer) status() map[string]interface{} {
 			"seeds_pushed":  atomic.LoadInt64(&s.seedsPushed),
 			"push_accepts":  atomic.LoadInt64(&s.pushAccepts),
 			"push_rejects":  atomic.LoadInt64(&s.pushRejects),
+			"rgba_served":   atomic.LoadInt64(&s.rgbaServed),
 			"commands":      atomic.LoadInt64(&s.cmdsTotal),
 		},
 	}

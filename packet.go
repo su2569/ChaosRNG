@@ -202,8 +202,28 @@ func (c *PacketCollector) mixEncrypted(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
+
+	var toMix []byte = payload
+	var cond []byte
+	if len(payload) >= purityMinBytes {
+		purity := ComputePurity(payload)
+		if purity < purityRejectBelow {
+			return
+		}
+		if purity < purityHighEnough {
+			cond = CondenseEntropy(payload)
+			if len(cond) == 0 {
+				return
+			}
+			toMix = cond
+		}
+	}
+	if cond != nil {
+		defer secureZero(cond)
+	}
+
 	iv := osRandom(ctrIVLen)
-	ct := aes256CTR(c.aesKey, iv, payload)
+	ct := aes256CTR(c.aesKey, iv, toMix)
 	if ct == nil {
 		return
 	}

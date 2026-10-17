@@ -104,7 +104,7 @@ func (c *TPMEntropyCollector) getRandom(n int) ([]byte, bool) {
 
 func (c *TPMEntropyCollector) Collect() {
 	if randBytes, ok := c.getRandom(32); ok {
-		c.pool.MixBytes(randBytes)
+		c.pool.MixBytesFiltered(randBytes)
 		secureZero(randBytes)
 	}
 	var b [16]byte
@@ -119,7 +119,7 @@ func (c *TPMEntropyCollector) Collect() {
 	for i := 0; i < 8; i++ {
 		b[8+i] = byte(cnt >> uint(8*i))
 	}
-	c.pool.MixBytes(b[:])
+	c.pool.MixBytesFiltered(b[:])
 }
 
 func (c *TPMEntropyCollector) Close() {

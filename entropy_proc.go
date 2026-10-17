@@ -101,13 +101,13 @@ func (c *ProcessSnapshotCollector) Collect() {
 			if !existed {
 				// 新生进程
 				binary.LittleEndian.PutUint32(bin[4:8], 0xdead)
-				c.pool.MixBytes(bin[:])
+				c.pool.MixBytesFiltered(bin[:])
 				n++
 			} else if pt > 0 && t > pt+10000 {
 				// 【修复】pt == 0 表示上一轮 OpenProcess 失败，此时 t 是绝对值，
 				// 不应参与抖动差分，否则会灌入大量伪噪声。
 				binary.LittleEndian.PutUint32(bin[4:8], uint32(t-pt))
-				c.pool.MixBytes(bin[:])
+				c.pool.MixBytesFiltered(bin[:])
 				n++
 			}
 		}
@@ -117,7 +117,7 @@ func (c *ProcessSnapshotCollector) Collect() {
 				var bin [8]byte
 				binary.LittleEndian.PutUint32(bin[0:4], pid)
 				binary.LittleEndian.PutUint32(bin[4:8], 0xbeef)
-				c.pool.MixBytes(bin[:])
+				c.pool.MixBytesFiltered(bin[:])
 				n++
 			}
 		}
@@ -126,7 +126,7 @@ func (c *ProcessSnapshotCollector) Collect() {
 			acc[i] = byte(ns >> uint(8*i))
 		}
 		binary.LittleEndian.PutUint32(acc[8:12], uint32(n))
-		c.pool.MixBytes(acc[:])
+		c.pool.MixBytesFiltered(acc[:])
 	}
 	c.prev = cur
 	c.have = true

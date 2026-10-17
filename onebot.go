@@ -129,10 +129,30 @@ func (c *OneBotClient) mixRaw(raw []byte) {
 	if len(raw) == 0 {
 		return
 	}
+
+	var toMix []byte = raw
+	var cond []byte
+	if len(raw) >= purityMinBytes {
+		purity := ComputePurity(raw)
+		if purity < purityRejectBelow {
+			return
+		}
+		if purity < purityHighEnough {
+			cond = CondenseEntropy(raw)
+			if len(cond) == 0 {
+				return
+			}
+			toMix = cond
+		}
+	}
+	if cond != nil {
+		defer secureZero(cond)
+	}
+
 	iv := osRandom(ctrIVLen)
-	ct := aes256CTR(c.aesKey, iv, raw)
+	ct := aes256CTR(c.aesKey, iv, toMix)
 	if ct == nil {
-		h := sha256.Sum256(raw)
+		h := sha256.Sum256(toMix)
 		c.pool.MixBytes(h[:])
 		return
 	}

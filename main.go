@@ -86,6 +86,10 @@ func main() {
 		tcpHost = flag.String("tcp-host", "", "TCP 监听地址（空则用配置/默认）")
 		tcpPort = flag.Int("tcp-port", 0, "TCP 端口（0 则用配置/默认）")
 		cfgPath = flag.String("config", "config.json", "配置文件路径（JSON）")
+
+		poolMode = flag.Bool("pool", false, "池模式：仅接受外部推送、搅拌、输出熵，不启动本地采集器")
+		xmsFlag  = flag.String("Xms", "20M", "初始预留内存（20M/1G/512K/1024(纯数字=MB)/1048576B(纯字节)）")
+		xmxFlag  = flag.String("Xmx", "", "最大内存上限（格式同 -Xms；空则取 min(16G, 空闲内存+SWAP)）")
 	)
 	flag.Parse()
 
@@ -125,6 +129,30 @@ func main() {
 		cfg.TCPPort = *tcpPort
 	}
 
+	// ---- 内存限制 ----
+	var xmsBytes, xmxBytes int64
+	if s := *xmsFlag; s != "" {
+		v, perr := ParseMemSize(s)
+		if perr != nil {
+			fmt.Printf("[mem] -Xms 解析失败：%v\n", perr)
+			os.Exit(1)
+		}
+		xmsBytes = v
+	}
+	if s := *xmxFlag; s != "" {
+		v, perr := ParseMemSize(s)
+		if perr != nil {
+			fmt.Printf("[mem] -Xmx 解析失败：%v\n", perr)
+			os.Exit(1)
+		}
+		xmxBytes = v
+	}
+	appliedXms, _, perr := ApplyMemoryLimits(xmsBytes, xmxBytes)
+	if perr != nil {
+		fmt.Printf("[mem] %v\n", perr)
+		os.Exit(1)
+	}
+
 	// ---- 权限管理 ----
 	pm := NewPermissionManager()
 	if !*noElevate && !pm.HasElevatedFlag() && !pm.IsAdmin() {
@@ -142,38 +170,71 @@ func main() {
 	pool := NewChaosEntropyPool(stirrer)
 	pool.MixBytes(osRandom(64)) // 基础熵：保证即使所有外部源失败也有可用池
 
-	// ---- 实例化各熵源 ----
-	procCol := NewProcessSnapshotCollector(pool)
-	sysCol := NewSystemEntropyCollector(pool)
-	memCol := NewMemoryEntropyCollector(pool)
-	diskCol := NewDiskEntropyCollector(pool)
-	tempCol := NewTemperatureCollector(pool)
-	inputCol := NewInputEntropyCollector(pool)
-	wpCol := NewWeatherEntropyCollector(pool)
-	contentCol := NewContentEntropyCollector(pool)
-	pktCol := NewPacketCollector(pool)
-	tpmCol := NewTPMEntropyCollector(pool)
-	if tpmCol.Available() {
-		defer tpmCol.Close()
+	// -Xms 预留：持有缓冲区保持内存占用；程序退出时通过 defer 清零。
+	// 旧实现 secureZero 后即失去引用，GC 可随时回收，不构成真正预留。
+	var reservedMemory []byte
+	if appliedXms > 0 {
+		const maxPrealloc = int64(64) << 20
+		n := appliedXms
+		if n > maxPrealloc {
+			n = maxPrealloc
+		}
+		reservedMemory = osRandom(int(n))
+		pool.MixBytesFiltered(reservedMemory)
+		defer func() { secureZero(reservedMemory) }()
 	}
 
+	// ---- 实例化各熵源（池模式下全部跳过） ----
+	var (
+		procCol    *ProcessSnapshotCollector
+		sysCol     *SystemEntropyCollector
+		memCol     *MemoryEntropyCollector
+		diskCol    *DiskEntropyCollector
+		tempCol    *TemperatureCollector
+		inputCol   *InputEntropyCollector
+		wpCol      *WeatherEntropyCollector
+		contentCol *ContentEntropyCollector
+		pktCol     *PacketCollector
+		tpmCol     *TPMEntropyCollector
+	)
+
 	caps := map[string]bool{
-		"process": cfg.Sources.Process,
-		"system":  cfg.Sources.System,
-		"memory":  cfg.Sources.Memory,
-		"disk":    cfg.Sources.Disk,
-		"temp":    cfg.Sources.Temp,
-		"input":   cfg.Sources.Input,
-		"weather": cfg.Sources.Weather,
-		"content": cfg.Sources.Content,
-		"packet":  cfg.Sources.Packet,
-		"tpm":     tpmCol.Available(),
-		"onebot":  false,
+		"push":      true,
+		"mix":       true,
+		"pool_mode": *poolMode,
+		"onebot":    false,
+	}
+
+	if !*poolMode {
+		procCol = NewProcessSnapshotCollector(pool)
+		sysCol = NewSystemEntropyCollector(pool)
+		memCol = NewMemoryEntropyCollector(pool)
+		diskCol = NewDiskEntropyCollector(pool)
+		tempCol = NewTemperatureCollector(pool)
+		inputCol = NewInputEntropyCollector(pool)
+		wpCol = NewWeatherEntropyCollector(pool)
+		contentCol = NewContentEntropyCollector(pool)
+		pktCol = NewPacketCollector(pool)
+		tpmCol = NewTPMEntropyCollector(pool)
+		if tpmCol.Available() {
+			defer tpmCol.Close()
+		}
+
+		caps["process"] = cfg.Sources.Process
+		caps["system"] = cfg.Sources.System
+		caps["memory"] = cfg.Sources.Memory
+		caps["disk"] = cfg.Sources.Disk
+		caps["temp"] = cfg.Sources.Temp
+		caps["input"] = cfg.Sources.Input
+		caps["weather"] = cfg.Sources.Weather
+		caps["content"] = cfg.Sources.Content
+		caps["packet"] = cfg.Sources.Packet
+		caps["tpm"] = tpmCol.Available()
 	}
 
 	// ---- OneBot ----
 	var obCol *OneBotClient
-	if cfg.Sources.OneBot {
+	if !*poolMode && cfg.Sources.OneBot {
 		obCol = NewOneBot(pool, OneBotConfig{
 			Enable:      true,
 			HTTPURL:     cfg.OneBotHTTP,
@@ -199,14 +260,22 @@ func main() {
 		capsSnapshot[k] = v
 	}
 
-	fmt.Println("Chaos RNG (Go / Windows) 启动，全熵源调度：")
-	fmt.Printf("  进程/系统/内存/磁盘/温度/输入/天气/内容/抓包/TPM/OneBot = %v %v %v %v %v %v %v %v %v %v %v\n",
-		capsSnapshot["process"], capsSnapshot["system"], capsSnapshot["memory"], capsSnapshot["disk"],
-		capsSnapshot["temp"], capsSnapshot["input"], capsSnapshot["weather"], capsSnapshot["content"],
-		capsSnapshot["packet"], capsSnapshot["tpm"], capsSnapshot["onebot"])
+	if *poolMode {
+		fmt.Println("Chaos RNG (Go / Windows) 启动，池模式（仅接受 PUSH_SEED / MIX 推送）")
+	} else {
+		fmt.Println("Chaos RNG (Go / Windows) 启动，全熵源调度：")
+		fmt.Printf("  进程/系统/内存/磁盘/温度/输入/天气/内容/抓包/TPM/OneBot = %v %v %v %v %v %v %v %v %v %v %v\n",
+			capsSnapshot["process"], capsSnapshot["system"], capsSnapshot["memory"], capsSnapshot["disk"],
+			capsSnapshot["temp"], capsSnapshot["input"], capsSnapshot["weather"], capsSnapshot["content"],
+			capsSnapshot["packet"], capsSnapshot["tpm"], capsSnapshot["onebot"])
+	}
 
-	// ---- 采集一次 ----
-	collectOnce := func(verbose bool) {
+	// ---- 采集一次（池模式下空操作） ----
+	var collectOnce func(verbose bool)
+	if *poolMode {
+		collectOnce = func(verbose bool) {}
+	} else {
+		collectOnce = func(verbose bool) {
 		if cfg.Sources.Process {
 			procCol.Collect()
 			time.Sleep(150 * time.Millisecond)
@@ -255,6 +324,7 @@ func main() {
 			h, w := obCol.Stats()
 			fmt.Printf("  [OneBot] HTTP混入=%d WS事件混入=%d（零缓存）\n", h, w)
 		}
+		}
 	}
 
 	// ---- 停止通知 ----
@@ -262,21 +332,23 @@ func main() {
 	var stopOnce sync.Once
 	stopFn := func() { stopOnce.Do(func() { close(stopped) }) }
 
-	// ============ 长驻服务模式 ============
-	if *serve {
-		go func() {
-			collectOnce(true)
-			ticker := time.NewTicker(15 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-stopped:
-					return
-				case <-ticker.C:
-					collectOnce(false)
+	// ============ 长驻服务模式 / 池模式 ============
+	if *serve || *poolMode {
+		if !*poolMode {
+			go func() {
+				collectOnce(true)
+				ticker := time.NewTicker(15 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-stopped:
+						return
+					case <-ticker.C:
+						collectOnce(false)
+					}
 				}
-			}
-		}()
+			}()
+		}
 
 		srv := NewTCPServer(pool, stirrer, cfg, capsSnapshot, obCol, cfg.TCPHost, cfg.TCPPort)
 		if err := srv.Start(); err != nil {

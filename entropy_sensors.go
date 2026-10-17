@@ -60,7 +60,7 @@ func (c *SystemEntropyCollector) Collect() {
 		buf[23] = byte(m.ullAvailPhys)
 		buf[24] = byte(m.ullAvailPhys >> 8)
 	}
-	c.pool.MixBytes(buf[:])
+	c.pool.MixBytesFiltered(buf[:])
 	c.lastTick = uint64(tick)
 }
 
@@ -89,7 +89,7 @@ func (c *MemoryEntropyCollector) Collect() {
 	for i := 0; i < 4; i++ {
 		b[24+i] = byte(ms.HeapAlloc >> uint(8*i))
 	}
-	c.pool.MixBytes(b[:])
+	c.pool.MixBytesFiltered(b[:])
 	secureZero(local)
 }
 
@@ -113,20 +113,28 @@ func (c *DiskEntropyCollector) Collect() {
 	drivesRet, _, _ := procGetLogicalDrives.Call()
 	drives := uint32(drivesRet)
 	root, _ := syscall.UTF16PtrFromString("C:\\")
-	var totalBytes, freeBytes int64
+	// 三个输出参数各取一份：avail（调用者配额内可用）、total（盘总容量）、
+	// totalFree（盘总空闲）。旧实现把 &freeBytes 同时传给 avail 和 totalFree，
+	// avail 的结果被 totalFree 覆盖丢弃；此处修正并把 avail 也混入池。
+	var freeAvailBytes, totalBytes, freeTotalBytes int64
 	if procGetDiskFreeSpaceExW.Find() == nil {
 		procGetDiskFreeSpaceExW.Call(
 			uintptr(unsafe.Pointer(root)),
-			uintptr(unsafe.Pointer(&freeBytes)),
+			uintptr(unsafe.Pointer(&freeAvailBytes)),
 			uintptr(unsafe.Pointer(&totalBytes)),
-			uintptr(unsafe.Pointer(&freeBytes)))
+			uintptr(unsafe.Pointer(&freeTotalBytes)))
 	}
 	var b [24]byte
 	for i := 0; i < 4; i++ {
 		b[i] = byte(drives >> uint(8*i))
 	}
+	// freeAvailBytes 融进 drives 的高位，保持 b 布局（24 字节）不变
+	b[0] ^= byte(freeAvailBytes)
+	b[1] ^= byte(freeAvailBytes >> 8)
+	b[2] ^= byte(freeAvailBytes >> 16)
+	b[3] ^= byte(freeAvailBytes >> 24)
 	for i := 0; i < 8; i++ {
-		b[4+i] = byte(freeBytes >> uint(8*i))
+		b[4+i] = byte(freeTotalBytes >> uint(8*i))
 	}
 	for i := 0; i < 8; i++ {
 		b[12+i] = byte(totalBytes >> uint(8*i))
@@ -135,7 +143,7 @@ func (c *DiskEntropyCollector) Collect() {
 	for i := 0; i < 4; i++ {
 		b[20+i] = byte(ns >> uint(8*i))
 	}
-	c.pool.MixBytes(b[:])
+	c.pool.MixBytesFiltered(b[:])
 }
 
 // ================= 温度熵 =================
@@ -161,7 +169,7 @@ func (c *TemperatureCollector) Collect() {
 		for i := 0; i < 4; i++ {
 			b[4+i] = byte(ns >> uint(8*i))
 		}
-		c.pool.MixBytes(b[:])
+		c.pool.MixBytesFiltered(b[:])
 		return
 	}
 	var sysPow struct {
@@ -185,7 +193,7 @@ func (c *TemperatureCollector) Collect() {
 	for i := 0; i < 8; i++ {
 		b[4+i] = byte(cnt >> uint(8*i))
 	}
-	c.pool.MixBytes(b[:])
+	c.pool.MixBytesFiltered(b[:])
 }
 
 // ---------- ACPI 读取实现 ----------
@@ -207,11 +215,23 @@ var guidACPI = syscall.GUID{
 }
 
 const (
-	ioctlAcpiThermalReadTemp = 0x00220000
-	genericeRead             = 0x80000000
-	fileAnyAccess            = 0
-	fileShareReadWrite       = 0x00000007
-	openExisting             = 3
+	// IOCTL_ACPI_THERMAL_READ_TEMPERATURE =
+	//     CTL_CODE(FILE_DEVICE_ACPI=0x32, 0x02, METHOD_BUFFERED=0, FILE_READ_DATA=0x01)
+	//   = (0x32 << 16) | (0x01 << 14) | (0x02 << 2) | 0
+	//   = 0x00324008
+	//
+	// 旧值 0x00220000|0x80000000 = 0x80220000 是错误的：
+	//   - 0x0022 是 FILE_DEVICE_UNKNOWN，不是 FILE_DEVICE_ACPI(0x32)
+	//   - 0x80000000 是 GENERIC_READ，不是 CTL_CODE 的 Access 位段
+	//   - DeviceIoControl 必然返回 ERROR_INVALID_FUNCTION，温度永远拿不到。
+	ioctlAcpiThermalReadTemp = 0x00324008
+
+	// CreateFileW 的 dwDesiredAccess 必须是 GENERIC_READ，
+	// 因为 IOCTL 的 access 是 FILE_READ_DATA，IO manager 会检查句柄权限。
+	// 旧值 fileAnyAccess = 0 打开后无读权限，DeviceIoControl 会被拒绝。
+	fileGenericRead    = 0x80000000
+	fileShareReadWrite = 0x00000007
+	openExisting       = 3
 )
 
 // 【修复】SP_DEVICE_INTERFACE_DATA 的 Reserved 是单个 ULONG_PTR（8 字节），
@@ -277,14 +297,14 @@ func readAcpiThermal() (int32, bool) {
 			continue
 		}
 		pathPtr := unsafe.Pointer(&buf[pathOff])
-		h, _, _ := procCreateFileW.Call(uintptr(pathPtr), fileAnyAccess,
+		h, _, _ := procCreateFileW.Call(uintptr(pathPtr), fileGenericRead,
 			uintptr(fileShareReadWrite), 0, openExisting, 0, 0)
 		if h == uintptr(0xffffffffffffffff) {
 			continue
 		}
 		var outBuf [4]byte
 		var bytesRet uint32
-		r3, _, _ := procDeviceIoControl.Call(h, ioctlAcpiThermalReadTemp|genericeRead,
+		r3, _, _ := procDeviceIoControl.Call(h, ioctlAcpiThermalReadTemp,
 			0, 0, uintptr(unsafe.Pointer(&outBuf[0])), 4,
 			uintptr(unsafe.Pointer(&bytesRet)), 0)
 		procCloseHandle.Call(h)
@@ -327,5 +347,5 @@ func (c *InputEntropyCollector) Collect() {
 	for i := 0; i < 8; i++ {
 		b[16+i] = byte(cnt >> uint(8*i))
 	}
-	c.pool.MixBytes(b[:])
+	c.pool.MixBytesFiltered(b[:])
 }
