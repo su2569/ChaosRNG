@@ -8,7 +8,7 @@ chaos_rng
 *.so
 *.dylib
 
-# 本地配置（含 token，别推）
+# 本地配置（可能含token）
 config.json
 config.local.json
 *.local.json
@@ -34,4 +34,5 @@ build/
 # 系统
 .DS_Store
 Thumbs.db
-desktop.inibuild.bat 
+desktop.ini
+build.bat
