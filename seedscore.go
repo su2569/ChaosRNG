@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows || linux
 
 package main
 
@@ -28,16 +28,16 @@ import (
 // 阈值策略：
 //   score < pushScoreMin(30)              -> 拒绝
 //   pushScoreMin ≤ score < pushScoreHigh  -> 先有损压缩(CondenseEntropy)再混入
-//   score ≥ pushScoreHigh(70)             -> 直接混入
+//   score ≥ pushScoreHigh(90)             -> 直接混入
 // ============================================================================
 
 const (
 	pushSeedBytes  = 32
 	pushSeedHexLen = 64
-	pushScoreMin   = 30.0 // 阈值放宽：纯度 <30% 才拒绝
-	pushScoreHigh  = 70.0 // 纯度 ≥70% 直接混入，否则先有损压缩
-	pushRatePerSec = 2.0
-	pushRateBurst  = 4
+	pushScoreMin   = 30.0 // 极低熵拒绝线（不压缩，直接拒绝）
+	// pushScoreHigh 已改为动态阈值（purityThresholds），见 pushHexSeed 第 5 步
+	pushRatePerSec = 2.0 // 默认值，可被 config.json 的 server.push_rate_per_sec 覆盖
+	pushRateBurst  = 4   // 默认值，可被 config.json 的 server.push_rate_burst 覆盖
 	pushRecentCap  = 64
 	pushMinHamming = 40
 )
@@ -250,8 +250,9 @@ type pushResult struct {
 // 便宜检查在前，避免无效请求消耗限流配额。
 //
 // 混池策略：
-//   score ≥ pushScoreHigh(70)  → 直接 MixBytes(raw)
-//   score <  pushScoreHigh(70) → 先 CondenseEntropy(raw) 有损压缩，再 MixBytes(cond)
+//
+//	score ≥ pushScoreHigh(90)  → 直接 MixBytes(raw)
+//	score <  pushScoreHigh(90) → 先 CondenseEntropy(raw) 有损压缩，再 MixBytes(cond)
 func pushHexSeed(pool *ChaosEntropyPool, perConn *pushLimiter, hexStr string) pushResult {
 	// 1. 格式校验
 	if len(hexStr) != pushSeedHexLen {
@@ -283,9 +284,11 @@ func pushHexSeed(pool *ChaosEntropyPool, perConn *pushLimiter, hexStr string) pu
 		}
 	}
 
-	// 5. 通过：记录 + 混池（低纯度先有损压缩）
+	// 5. 通过：记录 + 混池
+	// 用动态阈值（与 MixBytesFiltered 一致），避免固定 90 过度压缩 32 字节种子
 	globalSeedScore.Record(raw)
-	if score < pushScoreHigh {
+	_, highEnough := purityThresholds(len(raw))
+	if score < highEnough {
 		cond := CondenseEntropy(raw)
 		if len(cond) > 0 {
 			pool.MixBytes(cond)

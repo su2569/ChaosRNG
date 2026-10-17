@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows || linux
 
 package main
 
@@ -8,11 +8,46 @@ import (
 )
 
 // 纯度筛选参数（0~100）
+//
+// 说明：purityRejectBelow / purityHighEnough 是 32 字节样本的"标准阈值"，
+// 保留用于固定 32 字节种子的 pushHexSeed 场景。
+// 大小不定的样本（如熵源采集、MIX 命令）应使用 purityThresholds 动态阈值。
 const (
-	purityRejectBelow = 30.0
-	purityHighEnough  = 70.0
-	purityMinBytes    = 32
+	purityRejectBelow = 30.0 // 32 字节标准：拒绝线
+	purityHighEnough  = 90.0 // 32 字节标准：直混线
+	purityMinBytes    = 32   // 短于此长度跳过纯度筛选
 )
+
+// purityThresholds 按样本大小返回 (rejectBelow, highEnough)。
+//
+// 理论依据：
+//
+//	32 字节（256 bit）样本 Shannon 熵理论上限 log2(32)≈5，
+//	实际真随机常在 4.5~5.0，Monobit 有 ~2% 概率偏离 >2σ，
+//	导致大量真随机种子落在 78~85 分，90 阈值下都会被压缩。
+//	小样本统计功效不足，应放宽阈值；大样本统计可靠，可用标准阈值。
+//
+// 阈值矩阵：
+//
+//	n < 32      → 不筛选（0, 100），统计不可靠
+//	32 ≤ n < 64 → (20, 75)，2~4σ 随机波动区
+//	64 ≤ n < 256 → (25, 82)，逐步收紧
+//	256 ≤ n < 1024 → (28, 87)
+//	n ≥ 1024    → (30, 90)，标准阈值
+func purityThresholds(n int) (float64, float64) {
+	switch {
+	case n < purityMinBytes:
+		return 0, 100
+	case n < 64:
+		return 20, 75
+	case n < 256:
+		return 25, 82
+	case n < 1024:
+		return 28, 87
+	default:
+		return purityRejectBelow, purityHighEnough
+	}
+}
 
 // ComputePurity 综合 Shannon 熵、Monobit 均衡度、Runs 均衡度，返回 0~100 纯度分。
 func ComputePurity(data []byte) float64 {

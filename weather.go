@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows || linux
 
 package main
 
@@ -13,20 +13,26 @@ import (
 
 // 天气熵采集器：wttr.in 抓取各省温度，作为外部真熵混池。对应 aiohttp 版。
 type WeatherEntropyCollector struct {
-	pool    *ChaosEntropyPool
-	client  *http.Client
-	cities  map[string]string
-	stopCh  chan struct{}
-	stopped bool
-	mu      sync.Mutex
+	pool        *ChaosEntropyPool
+	client      *http.Client
+	cities      map[string]string
+	stopCh      chan struct{}
+	stopped     bool
+	mu          sync.Mutex
+	minInterval time.Duration // 节流：两次抓取最小间隔
+	lastFetch   time.Time     // 上次实际抓取时间
 }
 
-func NewWeatherEntropyCollector(p *ChaosEntropyPool) *WeatherEntropyCollector {
+func NewWeatherEntropyCollector(p *ChaosEntropyPool, intervalSec int) *WeatherEntropyCollector {
+	if intervalSec <= 0 {
+		intervalSec = 300 // 默认 5 分钟
+	}
 	return &WeatherEntropyCollector{
-		pool:   p,
-		client: &http.Client{Timeout: 8 * time.Second},
-		cities: defaultCities(),
-		stopCh: make(chan struct{}),
+		pool:        p,
+		client:      &http.Client{Timeout: 8 * time.Second},
+		cities:      defaultCities(),
+		stopCh:      make(chan struct{}),
+		minInterval: time.Duration(intervalSec) * time.Second,
 	}
 }
 
@@ -46,6 +52,15 @@ func defaultCities() map[string]string {
 
 // FetchOnce: 抽样 sampleCount 个城市并发抓取温度。
 func (w *WeatherEntropyCollector) FetchOnce(sampleCount int) int {
+	// 节流：距上次抓取不足 minInterval 时跳过
+	w.mu.Lock()
+	if !w.lastFetch.IsZero() && time.Since(w.lastFetch) < w.minInterval {
+		w.mu.Unlock()
+		return 0
+	}
+	w.lastFetch = time.Now()
+	w.mu.Unlock()
+
 	type res struct{ prov, temp string }
 	keys := make([]string, 0, len(w.cities))
 	for k := range w.cities {

@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows || linux
 
 package main
 
@@ -24,7 +24,7 @@ func interactiveShell(
 	fmt.Println()
 	fmt.Println("==================================================")
 	fmt.Println("🔥 Chaos RNG 控制台")
-	fmt.Println("命令: seed, lucky, status, caps, collect, weather, content, quit")
+	fmt.Println("命令: seed, lucky, status, caps, collect, weather, content, help, quit")
 	fmt.Println("==================================================")
 	fmt.Println()
 
@@ -71,6 +71,24 @@ func interactiveShell(
 				fmt.Printf("  %s %s\n", mark, k)
 			}
 
+		case "help", "h", "?":
+			fmt.Println("本地命令：")
+			fmt.Println("  seed     - 生成一个 32B 种子（hex）")
+			fmt.Println("  lucky    - 幸运数字 1~100")
+			fmt.Println("  status   - 输出服务器 JSON 状态")
+			fmt.Println("  caps     - 显示能力开关")
+			fmt.Println("  collect  - OneBot 混入计数")
+			fmt.Println("  weather  - 立即抓一次天气")
+			fmt.Println("  content  - 立即抓一次热榜")
+			fmt.Println("  help     - 本帮助")
+			fmt.Println("  quit     - 退出")
+			fmt.Println()
+			fmt.Println("TCP 命令（用 nc/脚本发到 18888）：")
+			fmt.Println("  GET_SEED / GET_HEX / GET_SEEDS <n>")
+			fmt.Println("  RGBA [size] / RGBA_STREAM [size] [fps] / STOP")
+			fmt.Println("  PUSH_SEED <hex> / MIX <hex> / PING / CAPS / STATUS <key> / HELP")
+			fmt.Println("  连接后发送 HELP 可看完整清单")
+
 		case "collect":
 			if obClient != nil {
 				h, w := obClient.Stats()
@@ -96,7 +114,7 @@ func interactiveShell(
 			}
 
 		default:
-			fmt.Println("未知命令: seed, lucky, status, caps, collect, weather, content, quit")
+			fmt.Println("未知命令，输入 help 查看列表")
 		}
 	}
 }

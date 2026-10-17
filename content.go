@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows || linux
 
 package main
 
@@ -11,15 +11,22 @@ import (
 
 // ContentEntropyCollector 抓取公开热榜并做纯度筛选后混池。
 type ContentEntropyCollector struct {
-	pool      *ChaosEntropyPool
-	client    *http.Client
-	endpoints []string
+	pool        *ChaosEntropyPool
+	client      *http.Client
+	endpoints   []string
+	minInterval time.Duration // 节流：两次抓取最小间隔
+	lastFetch   time.Time     // 上次实际抓取时间
+	mu          sync.Mutex
 }
 
-func NewContentEntropyCollector(p *ChaosEntropyPool) *ContentEntropyCollector {
+func NewContentEntropyCollector(p *ChaosEntropyPool, intervalSec int) *ContentEntropyCollector {
+	if intervalSec <= 0 {
+		intervalSec = 300 // 默认 5 分钟
+	}
 	return &ContentEntropyCollector{
-		pool:   p,
-		client: &http.Client{Timeout: 10 * time.Second},
+		pool:        p,
+		client:      &http.Client{Timeout: 10 * time.Second},
+		minInterval: time.Duration(intervalSec) * time.Second,
 		endpoints: []string{
 			"https://hacker-news.firebaseio.com/v0/topstories.json",
 			"https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1",
@@ -32,6 +39,15 @@ func NewContentEntropyCollector(p *ChaosEntropyPool) *ContentEntropyCollector {
 
 // FetchAll 并发抓取，成功才混池；纯度不足时压缩或拒绝。
 func (c *ContentEntropyCollector) FetchAll() int {
+	// 节流：距上次抓取不足 minInterval 时跳过
+	c.mu.Lock()
+	if !c.lastFetch.IsZero() && time.Since(c.lastFetch) < c.minInterval {
+		c.mu.Unlock()
+		return 0
+	}
+	c.lastFetch = time.Now()
+	c.mu.Unlock()
+
 	type out struct{ data []byte }
 	var wg sync.WaitGroup
 	ch := make(chan out, len(c.endpoints))

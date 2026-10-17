@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows || linux
 
 package main
 
@@ -89,6 +89,7 @@ type ChaosEntropyPool struct {
 	createdAt time.Time
 	stirrer   *HashStir
 	snapshot  atomic.Value // 存 [sha256.Size]byte，供无锁读
+	drbg      DRBG         // 可插拔 CSPRNG 后端（system/hmac/ctr/none），nil 表示旧逻辑
 }
 
 func NewChaosEntropyPool(stirrer *HashStir) *ChaosEntropyPool {
@@ -121,27 +122,34 @@ func (p *ChaosEntropyPool) MixBytes(b []byte) { p.mixRaw(p.stirrer.Stir(b)) }
 // MixBytesFiltered 先做纯度筛选再混池：
 //
 //	purity <  30%      -> 拒绝
-//	purity ∈ [30%,70%) -> 有损压缩后混入
-//	purity ≥  70%      -> 直接混入
+//	purity ∈ [30%,90%) -> 有损压缩后混入
+//	purity ≥  90%      -> 直接混入
 //
 // 短于 32 字节的样本统计不可靠，直接混入。
 func (p *ChaosEntropyPool) MixBytesFiltered(b []byte) bool {
 	if len(b) >= purityMinBytes {
+		rejectBelow, highEnough := purityThresholds(len(b))
 		purity := ComputePurity(b)
-		if purity < purityRejectBelow {
+		if purity < rejectBelow {
 			return false
 		}
-		if purity < purityHighEnough {
+		if purity < highEnough {
 			cond := CondenseEntropy(b)
 			if len(cond) == 0 {
 				return false
 			}
 			p.MixBytes(cond)
+			if p.drbg != nil {
+				p.drbg.Mix(cond)
+			}
 			secureZero(cond)
 			return true
 		}
 	}
 	p.MixBytes(b)
+	if p.drbg != nil {
+		p.drbg.Mix(b)
+	}
 	return true
 }
 
@@ -186,16 +194,37 @@ func GenerateSeeds(pool *ChaosEntropyPool, n int) []byte {
 	}
 	total := n * 32
 
-	// 1 次系统熵（一次系统调用拿全部）
+	// DRBG 模式：全部输出由选定 CSPRNG 后端产生
+	// system: SystemDRBG -> crypto/rand
+	// hmac:   HMAC-DRBG（纯软件，NIST SP 800-90A）
+	// ctr:    CTR-DRBG（纯软件，AES-NI 加速）
+	// none:   PhysicalDRBG（纯物理熵）
+	if pool.drbg != nil {
+		raw := pool.drbg.Generate(total)
+		if raw == nil || len(raw) != total {
+			return nil
+		}
+		// 只有 system 后端需要额外混入池摘要
+		// 原因：
+		//   - system.Mix 是空操作 → 必须在这里 XOR 让池熵参与输出
+		//   - hmac/ctr/mixed 的 Mix 已经立即 update(entropy) → DRBG 内部吸收了池熵
+		//   - 再 XOR d[i%32]（周期 32 字节）会强化 d 的微弱偏差，
+		//     导致 GM/T 二元推导检测（bit 距离 256）敏感项失败
+		// 用类型判断而非字符串比较，避免 Name() 改文本时静默失效
+		if _, isSystem := pool.drbg.(*SystemDRBG); isSystem {
+			d := pool.DigestFast()
+			for i := 0; i < total; i++ {
+				raw[i] ^= d[i%32]
+			}
+		}
+		return raw
+	}
+
+	// 旧行为：osRandom XOR 池快照 XOR 时间戳
 	sys := osRandom(total)
-
-	// 1 次池摘要（无锁读）
 	d := pool.DigestFast()
-
-	// 1 次时间戳哈希
 	ts := sha256.Sum256(safeTimestampBytes())
 
-	// XOR 混合
 	out := make([]byte, total)
 	for i := 0; i < n; i++ {
 		base := i * 32
